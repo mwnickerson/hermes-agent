@@ -226,7 +226,17 @@ def should_post_project_thread_event(kind: str, payload: dict[str, Any] | None =
         return True
     if kind == "completed":
         meta = _meta_from_payload(payload)
-        return bool(meta.get("user_visible_change") or meta.get("dsr_visible") or meta.get("dsr_include") or meta.get("project_final") or payload.get("summary"))
+        # Completion summaries are required for Kanban handoffs, but they are
+        # not automatically Discord-worthy. Project-thread completion posts are
+        # opt-in via explicit user-visible / DSR / final-project metadata so
+        # routine leaf completions do not become thread spam.
+        return bool(
+            meta.get("user_visible_change")
+            or meta.get("dsr_visible")
+            or meta.get("dsr_include")
+            or meta.get("project_final")
+            or meta.get("project_completion")
+        )
     if kind == "commented":
         text = str(payload.get("body") or payload.get("comment") or "").lower()
         return any(word in text for word in ("block", "approval", "review", "done", "complete", "milestone"))

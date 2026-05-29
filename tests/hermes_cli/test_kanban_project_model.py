@@ -75,3 +75,14 @@ def test_dsr_project_activity_only_user_visible():
     rows = kpm.dsr_project_activity(con, now - 100, now + 100)
     assert [r["task_id"] for r in rows] == ["visible"]
     assert rows[0]["summary"] == "Visible outcome"
+
+
+def test_completed_project_thread_posts_are_metadata_gated():
+    assert kpm.should_post_project_thread_event(
+        "completed",
+        {"summary": "routine handoff", "metadata": {"project_hub_slug": "project-one"}},
+    ) is False
+    assert kpm.should_post_project_thread_event(
+        "completed",
+        {"summary": "visible", "metadata": {"project_hub_slug": "project-one", "user_visible_change": True}},
+    ) is True
