@@ -119,9 +119,32 @@ def _conn(board: Optional[str] = None):
     """
     try:
         kanban_db.init_db(board=board)
+    except kanban_db.KanbanDbCorruptError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "kanban_db_corrupt",
+                "db_path": str(exc.db_path),
+                "backup_path": str(exc.backup_path) if exc.backup_path else None,
+                "reason": exc.reason,
+                "suggested_recovery": "Run `hermes kanban repair --reindex` for index-only failures or `hermes kanban repair --recover` for hard corruption.",
+            },
+        ) from exc
     except Exception as exc:
         log.warning("kanban init_db failed: %s", exc)
-    return kanban_db.connect(board=board)
+    try:
+        return kanban_db.connect(board=board)
+    except kanban_db.KanbanDbCorruptError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "kanban_db_corrupt",
+                "db_path": str(exc.db_path),
+                "backup_path": str(exc.backup_path) if exc.backup_path else None,
+                "reason": exc.reason,
+                "suggested_recovery": "Run `hermes kanban repair --reindex` for index-only failures or `hermes kanban repair --recover` for hard corruption.",
+            },
+        ) from exc
 
 
 # ---------------------------------------------------------------------------

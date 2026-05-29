@@ -261,16 +261,17 @@ def get_current_board() -> str:
     """Return the active board slug, honouring the resolution chain.
 
     Order (highest precedence first):
-
     1. ``HERMES_KANBAN_BOARD`` env var (set by the dispatcher on worker
        spawn, or manually for ad-hoc overrides).
     2. ``<root>/kanban/current`` on disk (set by ``hermes kanban boards
        switch``), but only when that board still exists.
     3. ``DEFAULT_BOARD`` (``"default"``).
 
-    A malformed or stale slug at any step falls through to the next layer
-    with a best-effort warning — the dispatcher must never crash because a
-    user hand-edited a file or removed a board directory.
+    Important safety rule: ``HERMES_KANBAN_BOARD`` is a *slug*, not a
+    filesystem path. File-path pinning belongs in ``HERMES_KANBAN_DB``.
+    Silently falling back to ``default`` for a path-like board value lets
+    ad-hoc test harnesses write their fixture tasks into the live board,
+    so path-shaped values fail closed with a clear error.
     """
     env = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
     if env:
@@ -278,8 +279,12 @@ def get_current_board() -> str:
             normed = _normalize_board_slug(env)
             if normed and board_exists(normed):
                 return normed
-        except ValueError:
-            pass
+        except ValueError as exc:
+            if os.sep in env or (os.altsep and os.altsep in env) or env.endswith(".db"):
+                raise ValueError(
+                    "HERMES_KANBAN_BOARD expects a board slug, not a database path; "
+                    "use HERMES_KANBAN_DB to pin a kanban.db file"
+                ) from exc
     try:
         f = current_board_path()
         if f.exists():
@@ -366,7 +371,16 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
     override = os.environ.get("HERMES_KANBAN_DB", "").strip()
     if override:
         return Path(override).expanduser()
-    slug = _normalize_board_slug(board)
+    try:
+        slug = _normalize_board_slug(board)
+    except ValueError as exc:
+        board_s = str(board).strip() if board is not None else ""
+        if os.sep in board_s or (os.altsep and os.altsep in board_s) or board_s.endswith(".db"):
+            raise ValueError(
+                "board= expects a board slug, not a database path; pass db_path=... "
+                "or set HERMES_KANBAN_DB to pin a kanban.db file"
+            ) from exc
+        raise
     if slug is None:
         slug = get_current_board()
     if slug == DEFAULT_BOARD:
@@ -1201,6 +1215,33 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     return candidate
 
 
+def _integrity_reason_is_index_only(reason: str) -> bool:
+    """Return True for integrity failures that SQLite can usually fix via REINDEX."""
+    marker = "integrity_check returned "
+    detail = reason
+    if marker in detail:
+        detail = detail.split(marker, 1)[1].strip().strip("'")
+    lines = [line.strip() for line in detail.splitlines() if line.strip()]
+    return bool(lines) and all(line.startswith("wrong # of entries in index ") for line in lines)
+
+
+def _try_reindex_repair(path: Path) -> bool:
+    """Attempt self-healing for index-only integrity failures."""
+    try:
+        conn = _sqlite_connect(path)
+        try:
+            conn.execute("REINDEX")
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            row = conn.execute("PRAGMA integrity_check").fetchone()
+            return bool(row and (row[0] or "").lower() == "ok")
+        finally:
+            conn.close()
+    except sqlite3.OperationalError:
+        raise
+    except sqlite3.DatabaseError:
+        return False
+
+
 def _guard_existing_db_is_healthy(path: Path) -> None:
     """Run ``PRAGMA integrity_check`` on an existing non-empty DB file.
 
@@ -1256,6 +1297,8 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     if reason is None:
         return
     backup = _backup_corrupt_db(resolved)
+    if _integrity_reason_is_index_only(reason) and _try_reindex_repair(resolved):
+        return
     raise KanbanDbCorruptError(resolved, backup, reason)
 
 
@@ -1746,6 +1789,53 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     from hermes_cli.profiles import normalize_profile_name
 
     return normalize_profile_name(assignee)
+
+
+def _conn_db_path(conn: sqlite3.Connection) -> Optional[Path]:
+    """Best-effort path for the main database behind ``conn``."""
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+        if row is None:
+            return None
+        # sqlite3.Row or tuple depending on caller connection setup.
+        raw = row["file"] if isinstance(row, sqlite3.Row) else row[2]
+        return Path(str(raw)).expanduser().resolve() if raw else None
+    except Exception:
+        return None
+
+
+def _is_live_default_board_path(path: Optional[Path]) -> bool:
+    if path is None:
+        return False
+    try:
+        resolved = path.resolve()
+        return (
+            resolved == (kanban_home() / "kanban.db").resolve()
+            and resolved == (Path.home() / ".hermes" / "kanban.db").resolve()
+        )
+    except OSError:
+        return False
+
+
+def _assert_live_board_write_allowed(
+    conn: sqlite3.Connection,
+    *,
+    title: str,
+    created_by: Optional[str],
+) -> None:
+    """Block obvious test-fixture writes from silently polluting the live board."""
+    if os.environ.get("HERMES_ALLOW_LIVE_KANBAN_TEST_WRITES", "").strip() == "1":
+        return
+    if not _is_live_default_board_path(_conn_db_path(conn)):
+        return
+    creator = (created_by or "").strip().casefold()
+    suspicious_titles = {"root task", "weak root task", "dep a", "dep b"}
+    if creator == "test-harness" or title.strip().casefold() in suspicious_titles:
+        raise ValueError(
+            "refusing obvious test-harness task write to the live default Kanban board; "
+            "pin a fixture DB with HERMES_KANBAN_DB or connect(db_path=...), or set "
+            "HERMES_ALLOW_LIVE_KANBAN_TEST_WRITES=1 for an intentional live-board test"
+        )
 
 
 def create_task(

@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import shlex
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -222,8 +223,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     sub = kanban_parser.add_subparsers(dest="kanban_action")
 
-    # --- init ---
+    # --- init / health ---
     sub.add_parser("init", help="Create kanban.db if missing (idempotent)")
+    p_doctor = sub.add_parser("doctor", help="Check Kanban DB integrity without modifying it")
+    p_doctor.add_argument("--json", action="store_true")
+    p_repair = sub.add_parser("repair", help="Repair recoverable Kanban DB integrity issues")
+    p_repair.add_argument("--reindex", action="store_true", help="Run REINDEX for index-only integrity failures")
+    p_repair.add_argument("--yes", action="store_true", help="Proceed without interactive confirmation")
+    p_repair.add_argument("--json", action="store_true")
 
     # --- boards (new in v2: multi-project support) ---
     p_boards = sub.add_parser(
@@ -865,6 +872,9 @@ def kanban_command(args: argparse.Namespace) -> int:
     if action == "boards":
         return _dispatch_boards(args)
 
+    if action in {"doctor", "repair"}:
+        return _cmd_doctor(args) if action == "doctor" else _cmd_repair(args)
+
     # `--board <slug>` applies to every subcommand below by way of an
     # env-var pin for the duration of this call. Using HERMES_KANBAN_BOARD
     # (rather than threading `board=` through 50+ kb.connect() sites)
@@ -974,6 +984,85 @@ def kanban_command(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
+
+def _health_db_path(args: argparse.Namespace) -> Path:
+    board = getattr(args, "board", None)
+    if board:
+        normed = kb._normalize_board_slug(board)
+        if not normed:
+            raise ValueError("--board requires a slug")
+        if normed != kb.DEFAULT_BOARD and not kb.board_exists(normed):
+            raise ValueError(f"board {normed!r} does not exist")
+        return kb.kanban_db_path(board=normed)
+    return kb.kanban_db_path()
+
+
+def _integrity_rows(path: Path) -> list[str]:
+    if not path.exists() or path.stat().st_size == 0:
+        return ["missing"]
+    conn = sqlite3.connect(path)
+    try:
+        return [str(row[0]) for row in conn.execute("PRAGMA integrity_check").fetchall()]
+    finally:
+        conn.close()
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    path = _health_db_path(args)
+    rows = _integrity_rows(path)
+    ok = rows == ["ok"]
+    payload = {"db_path": str(path), "ok": ok, "integrity": rows}
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2))
+    else:
+        print(f"Kanban DB: {path}")
+        print("Integrity: ok" if ok else "Integrity: FAILED")
+        if not ok:
+            for row in rows:
+                print(f"  - {row}")
+    return 0 if ok else 1
+
+
+def _cmd_repair(args: argparse.Namespace) -> int:
+    path = _health_db_path(args)
+    rows = _integrity_rows(path)
+    if rows == ["ok"]:
+        result = {"db_path": str(path), "changed": False, "ok": True, "message": "already ok"}
+        print(json.dumps(result, indent=2) if getattr(args, "json", False) else "Kanban DB integrity is already ok")
+        return 0
+    if not getattr(args, "reindex", False):
+        print("kanban: integrity check failed; rerun with `hermes kanban repair --reindex --yes` for index-only repair", file=sys.stderr)
+        for row in rows:
+            print(f"  - {row}", file=sys.stderr)
+        return 1
+    if not all(row.startswith("wrong # of entries in index ") for row in rows):
+        print("kanban: refusing REINDEX because integrity failure is not index-only", file=sys.stderr)
+        for row in rows:
+            print(f"  - {row}", file=sys.stderr)
+        return 2
+    if not getattr(args, "yes", False):
+        print("kanban: repair requires --yes after reviewing the index-only failures", file=sys.stderr)
+        return 2
+    backup = kb._backup_corrupt_db(path)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("REINDEX")
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        after = [str(row[0]) for row in conn.execute("PRAGMA integrity_check").fetchall()]
+    finally:
+        conn.close()
+    ok = after == ["ok"]
+    result = {"db_path": str(path), "backup_path": str(backup) if backup else None, "changed": True, "ok": ok, "before": rows, "after": after}
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"Backup: {backup or '<backup failed>'}")
+        print("Repair: ok" if ok else "Repair: FAILED")
+        if not ok:
+            for row in after:
+                print(f"  - {row}")
+    return 0 if ok else 1
+
 
 def _profile_author() -> str:
     """Best-effort author name for an interactive CLI call."""

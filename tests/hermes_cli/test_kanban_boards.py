@@ -191,8 +191,17 @@ class TestCurrentBoard:
 
     def test_invalid_env_falls_through(self, fresh_home, monkeypatch):
         monkeypatch.setenv("HERMES_KANBAN_BOARD", "!!bad!!")
-        # Should not crash — falls through to default.
+        # Non-path garbage still falls through to default.
         assert kb.get_current_board() == "default"
+
+    def test_path_like_env_fails_closed_instead_of_live_default(self, fresh_home, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", str(tmp_path / "kanban.db"))
+        with pytest.raises(ValueError, match="HERMES_KANBAN_DB"):
+            kb.get_current_board()
+
+    def test_path_like_board_argument_fails_closed(self, fresh_home, tmp_path):
+        with pytest.raises(ValueError, match="db_path"):
+            kb.kanban_db_path(board=str(tmp_path / "kanban.db"))
 
     def test_clear_current_board(self, fresh_home):
         kb.create_board("x")
