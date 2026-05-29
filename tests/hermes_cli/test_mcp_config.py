@@ -6,12 +6,7 @@ any actual MCP servers or API keys.
 """
 
 import argparse
-import json
-import os
-import types
 from pathlib import Path
-from typing import Any, Dict, List
-from unittest.mock import MagicMock, patch, PropertyMock
 
 import pytest
 
@@ -43,7 +38,7 @@ def _make_args(**kwargs):
     defaults = {
         "name": "test-server",
         "url": None,
-        "command": None,
+        "mcp_command": None,
         "args": None,
         "auth": None,
         "preset": None,
@@ -233,7 +228,7 @@ class TestMcpAdd:
 
         cmd_mcp_add(_make_args(
             name="github",
-            command="npx",
+            mcp_command="npx",
             args=["@mcp/github"],
         ))
         out = capsys.readouterr().out
@@ -291,7 +286,7 @@ class TestMcpAdd:
 
         cmd_mcp_add(_make_args(
             name="github",
-            command="npx",
+            mcp_command="npx",
             args=["@mcp/github"],
             env=["MY_API_KEY=secret123", "DEBUG=true"],
         ))
@@ -313,7 +308,7 @@ class TestMcpAdd:
 
         cmd_mcp_add(_make_args(
             name="github",
-            command="npx",
+            mcp_command="npx",
             args=["@mcp/github"],
             env=["BAD-NAME=value"],
         ))
@@ -390,7 +385,7 @@ class TestMcpAdd:
         cmd_mcp_add(_make_args(
             name="custom",
             preset="testmcp",
-            command="uvx",
+            mcp_command="uvx",
             args=["custom-server"],
         ))
         out = capsys.readouterr().out
