@@ -1077,6 +1077,17 @@ def test_comments_recorded_in_order(kanban_home):
     assert [c.author for c in comments] == ["user", "researcher"]
 
 
+def test_comment_event_includes_body_for_event_driven_mirrors(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x")
+        kb.add_comment(conn, t, "user", "milestone complete")
+        events = kb.list_events(conn, t)
+    commented = [e for e in events if e.kind == "commented"][-1]
+    assert commented.payload is not None
+    assert commented.payload["body"] == "milestone complete"
+    assert commented.payload["len"] == len("milestone complete")
+
+
 def test_empty_comment_rejected(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x")
