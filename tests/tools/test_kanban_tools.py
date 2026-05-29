@@ -417,6 +417,10 @@ def test_complete_with_artifacts_lands_in_event_payload(worker_env):
         completed = [e for e in events if e.kind == "completed"]
         assert len(completed) == 1
         payload = completed[0].payload or {}
+        assert payload.get("metadata", {}).get("artifacts") == [
+            "/tmp/q3-revenue.png",
+            "/tmp/q3-report.pdf",
+        ]
         assert payload.get("artifacts") == [
             "/tmp/q3-revenue.png",
             "/tmp/q3-report.pdf",

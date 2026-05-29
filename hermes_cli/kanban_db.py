@@ -3326,6 +3326,14 @@ def complete_task(
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
         }
+        if isinstance(metadata, dict) and metadata:
+            # Keep the structured completion handoff available to event-driven
+            # consumers (Discord/project-thread mirrors, dashboard streams,
+            # DSR collectors) without requiring a second lookup into task_runs.
+            # This is intentionally the same metadata object persisted on the
+            # run row; downstream gates such as project-thread posting rely on
+            # flags like user_visible_change/project_final living here.
+            completed_payload["metadata"] = metadata
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
         # Carry artifact paths in the event payload so the gateway
