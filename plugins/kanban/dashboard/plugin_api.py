@@ -50,6 +50,7 @@ from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
+from hermes_cli import kanban_project_model as kpm
 
 log = logging.getLogger(__name__)
 
@@ -503,6 +504,125 @@ def get_board(
             "latest_event_id": int(latest_event_id),
             "now": int(time.time()),
         }
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Project-centric API
+# ---------------------------------------------------------------------------
+
+@router.get("/projects")
+def get_projects(
+    include_archived: bool = Query(False),
+    board: Optional[str] = Query(None),
+):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        return {"projects": kpm.project_rows(conn, include_archived=include_archived)}
+    finally:
+        conn.close()
+
+
+class ProjectActionBody(BaseModel):
+    reason: Optional[str] = None
+
+
+def _project_task_ids(conn: sqlite3.Connection, project_slug: str) -> list[str]:
+    projects = kpm.project_rows(conn, include_archived=True)
+    target = next((p for p in projects if p.get("project_hub_slug") == project_slug), None)
+    if not target:
+        raise HTTPException(status_code=404, detail=f"project {project_slug!r} not found")
+    root_id = target.get("kanban_root_task_id")
+    if not root_id:
+        raise HTTPException(status_code=404, detail=f"project {project_slug!r} has no Kanban root")
+    return sorted(kpm.component_task_ids(conn, str(root_id)))
+
+
+def _append_dashboard_event(conn: sqlite3.Connection, task_id: str, kind: str, payload: dict[str, Any]) -> None:
+    conn.execute(
+        "INSERT INTO task_events(task_id, run_id, kind, payload, created_at) VALUES (?, NULL, ?, ?, ?)",
+        (task_id, kind, json.dumps(payload), int(time.time())),
+    )
+
+
+@router.post("/projects/{project_slug}/pause")
+def pause_project(project_slug: str, payload: ProjectActionBody | None = None, board: Optional[str] = Query(None)):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        ids = _project_task_ids(conn, project_slug)
+        reason = (payload.reason if payload else None) or "paused from Kanban Projects dashboard"
+        with conn:
+            for task_id in ids:
+                conn.execute("UPDATE tasks SET status='scheduled', claim_lock=NULL, claim_expires=NULL WHERE id=? AND status IN ('ready','todo','triage')", (task_id,))
+            _append_dashboard_event(conn, ids[0], "project_paused", {"project_hub_slug": project_slug, "reason": reason, "discord_silent": True})
+        return {"ok": True, "project_hub_slug": project_slug, "affected_task_ids": ids}
+    finally:
+        conn.close()
+
+
+@router.post("/projects/{project_slug}/resume")
+def resume_project(project_slug: str, payload: ProjectActionBody | None = None, board: Optional[str] = Query(None)):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        ids = _project_task_ids(conn, project_slug)
+        reason = (payload.reason if payload else None) or "resumed from Kanban Projects dashboard"
+        with conn:
+            for task_id in ids:
+                conn.execute("UPDATE tasks SET status='ready' WHERE id=? AND status='scheduled'", (task_id,))
+            _append_dashboard_event(conn, ids[0], "project_resumed", {"project_hub_slug": project_slug, "reason": reason, "discord_silent": True})
+        return {"ok": True, "project_hub_slug": project_slug, "affected_task_ids": ids}
+    finally:
+        conn.close()
+
+
+@router.post("/projects/{project_slug}/archive")
+def archive_project(project_slug: str, payload: ProjectActionBody | None = None, board: Optional[str] = Query(None)):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        ids = _project_task_ids(conn, project_slug)
+        reason = (payload.reason if payload else None) or "archived from Kanban Projects dashboard"
+        archived: list[str] = []
+        blocked_running: list[str] = []
+        with conn:
+            for task_id in ids:
+                row = conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()
+                status_value = row["status"] if row else None
+                if status_value == "running":
+                    conn.execute("UPDATE tasks SET status='blocked', result=? WHERE id=?", ("Paused at safe boundary requested by project archive action.", task_id))
+                    _append_dashboard_event(conn, task_id, "blocked", {"project_hub_slug": project_slug, "reason": "project archive requested; stop at safe boundary", "discord_silent": True})
+                    blocked_running.append(task_id)
+                elif status_value != "archived":
+                    conn.execute("UPDATE tasks SET status='archived' WHERE id=?", (task_id,))
+                    _append_dashboard_event(conn, task_id, "archived", {"project_hub_slug": project_slug, "reason": reason, "discord_silent": True})
+                    archived.append(task_id)
+            _append_dashboard_event(conn, ids[0], "project_archived", {"project_hub_slug": project_slug, "reason": reason, "discord_silent": True, "archived": archived, "blocked_running": blocked_running})
+        return {"ok": True, "project_hub_slug": project_slug, "archived": archived, "blocked_running": blocked_running}
+    finally:
+        conn.close()
+
+
+@router.post("/projects/{project_slug}/retry")
+def retry_project(project_slug: str, payload: ProjectActionBody | None = None, board: Optional[str] = Query(None)):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        ids = _project_task_ids(conn, project_slug)
+        reason = (payload.reason if payload else None) or "retry requested from Kanban Projects dashboard"
+        retried: list[str] = []
+        with conn:
+            for task_id in ids:
+                row = conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()
+                if row and row["status"] in {"blocked", "scheduled"}:
+                    conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, current_run_id=NULL WHERE id=?", (task_id,))
+                    _append_dashboard_event(conn, task_id, "unblocked", {"project_hub_slug": project_slug, "reason": reason, "discord_silent": True})
+                    retried.append(task_id)
+            _append_dashboard_event(conn, ids[0], "project_retry", {"project_hub_slug": project_slug, "reason": reason, "discord_silent": True, "retried": retried})
+        return {"ok": True, "project_hub_slug": project_slug, "retried": retried}
     finally:
         conn.close()
 

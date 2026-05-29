@@ -469,6 +469,8 @@
     const [showNewBoard, setShowNewBoard] = useState(false);
 
     const [kanbanBoard, setKanbanBoard] = useState(null);  // the grid data
+    const [projectData, setProjectData] = useState({ projects: [] });
+    const [activeView, setActiveView] = useState("projects");
     // Alias so the rest of the function can keep using `board` semantically
     // for the grid data (card columns + tenants + assignees) without
     // colliding with the selected-board slug above. History: the old
@@ -540,6 +542,15 @@
         .finally(function () { setLoading(false); });
     }, [tenantFilter, includeArchived, board]);
 
+    const loadProjects = useCallback(() => {
+      const qs = new URLSearchParams();
+      if (includeArchived) qs.set("include_archived", "true");
+      const url = qs.toString() ? `${API}/projects?${qs}` : `${API}/projects`;
+      return SDK.fetchJSON(withBoard(url, board))
+        .then(function (data) { setProjectData(data || { projects: [] }); })
+        .catch(function (err) { setError(String(err && err.message ? err.message : err)); });
+    }, [includeArchived, board]);
+
     // --- load list of boards for the switcher ------------------------------
     const loadBoardList = useCallback(function () {
       return SDK.fetchJSON(withBoard(`${API}/boards`, board))
@@ -569,18 +580,20 @@
       reloadTimerRef.current = setTimeout(function () {
         reloadTimerRef.current = null;
         loadBoard();
+        loadProjects();
       }, 250);
-    }, [loadBoard]);
+    }, [loadBoard, loadProjects]);
 
     useEffect(function () {
       loadBoard();
+      loadProjects();
       return function () {
         if (reloadTimerRef.current) {
           clearTimeout(reloadTimerRef.current);
           reloadTimerRef.current = null;
         }
       };
-    }, [loadBoard]);
+    }, [loadBoard, loadProjects]);
 
     // --- WebSocket ---------------------------------------------------------
     useEffect(function () {
@@ -693,6 +706,53 @@
         loadBoard();
       });
     }, [loadBoard, board, t]);
+
+    const projectAction = useCallback(function (slug, action) {
+      return SDK.fetchJSON(withBoard(`${API}/projects/${encodeURIComponent(slug)}/${action}`, board), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason: `dashboard ${action}` }),
+      }).then(function () {
+        loadBoard();
+        loadProjects();
+      }).catch(function (err) {
+        setError(`${action} failed: ${parseApiErrorMessage(err)}`);
+      });
+    }, [board, loadBoard, loadProjects]);
+
+    function renderProjectsView() {
+      const projects = (projectData && projectData.projects) || [];
+      if (!projects.length) {
+        return h(Card, null, h(CardContent, { className: "p-6 text-sm text-muted-foreground" }, "No Project Hub-linked Kanban projects found. Raw Board still shows all tasks."));
+      }
+      return h("div", { className: "grid gap-3" }, projects.map(function (p) {
+        const latest = p.latest_update || {};
+        const blockers = p.blockers || [];
+        return h(Card, { key: p.project_hub_slug }, h(CardContent, { className: "p-4 flex flex-col gap-3" },
+          h("div", { className: "flex items-start justify-between gap-3" },
+            h("div", null,
+              h("div", { className: "font-semibold" }, p.title || p.project_hub_slug),
+              h("div", { className: "text-xs text-muted-foreground" }, `Project Hub: ${p.project_hub_slug} · root ${p.kanban_root_task_id || "—"}`)
+            ),
+            h(Badge, { variant: blockers.length ? "destructive" : "secondary" }, p.project_hub_status || "active")
+          ),
+          h("div", { className: "grid md:grid-cols-2 gap-2 text-sm" },
+            h("div", null, h("span", { className: "text-muted-foreground" }, "Latest: "), latest.title ? `${latest.title} (${latest.status || ""})` : "—"),
+            h("div", null, h("span", { className: "text-muted-foreground" }, "Next: "), p.next_step || "—"),
+            h("div", null, h("span", { className: "text-muted-foreground" }, "Active agents: "), (p.active_agents || []).join(", ") || "—"),
+            h("div", null, h("span", { className: "text-muted-foreground" }, "Blockers: "), blockers.length ? blockers.map(function (b) { return b.title || b.id; }).join("; ") : "none")
+          ),
+          h("div", { className: "flex flex-wrap gap-2" },
+            h(Button, { size: "sm", variant: "outline", onClick: function () { projectAction(p.project_hub_slug, "pause"); } }, "Pause"),
+            h(Button, { size: "sm", variant: "outline", onClick: function () { projectAction(p.project_hub_slug, "resume"); } }, "Resume"),
+            h(Button, { size: "sm", variant: "outline", onClick: function () { projectAction(p.project_hub_slug, "retry"); } }, "Retry"),
+            h(Button, { size: "sm", variant: "outline", onClick: function () { projectAction(p.project_hub_slug, "archive"); } }, "Archive"),
+            p.discord_thread_id ? h(Button, { size: "sm", variant: "ghost", onClick: function () { window.open(`https://discord.com/channels/@me/${p.discord_thread_id}`, "_blank"); } }, "Open thread") : null,
+            h(Button, { size: "sm", variant: "ghost", onClick: function () { setActiveView("raw"); } }, "Raw graph")
+          )
+        ));
+      }));
+    }
 
     const clearSelected = useCallback(function () {
       setSelectedIds(new Set());
@@ -991,11 +1051,15 @@
           },
         }) : null,
         h(OrchestrationPanel, null),
-        h(AttentionStrip, {
+        h("div", { className: "flex gap-2" },
+          h(Button, { size: "sm", variant: activeView === "projects" ? "default" : "outline", onClick: function () { setActiveView("projects"); } }, "Projects"),
+          h(Button, { size: "sm", variant: activeView === "raw" ? "default" : "outline", onClick: function () { setActiveView("raw"); } }, "Raw Board")
+        ),
+        activeView === "raw" ? h(AttentionStrip, {
           boardData,
           onOpen: setSelectedTaskId,
-        }),
-        h(BoardToolbar, {
+        }) : null,
+        activeView === "raw" ? h(BoardToolbar, {
           board: boardData,
           tenantFilter, setTenantFilter,
           assigneeFilter, setAssigneeFilter,
@@ -1008,8 +1072,8 @@
               .catch(function (e) { setError(String(e.message || e)); });
           },
           onRefresh: loadBoard,
-        }),
-       selectedIds.size > 0 ? h(BulkActionBar, {
+        }) : null,
+       activeView === "raw" && selectedIds.size > 0 ? h(BulkActionBar, {
          count: selectedIds.size,
          assignees: (boardData && boardData.assignees) || [],
          onApply: applyBulk,
@@ -1018,7 +1082,7 @@
          onDelete: deleteSelected,
        }) : null,
         error ? h("div", { className: "text-xs text-destructive px-2" }, error) : null,
-        h(BoardColumns, {
+        activeView === "projects" ? renderProjectsView() : h(BoardColumns, {
           board: filteredBoard,
           laneByProfile,
           selectedIds,
