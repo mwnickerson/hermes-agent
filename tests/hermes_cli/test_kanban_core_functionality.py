@@ -1701,6 +1701,88 @@ def test_build_worker_context_uses_parent_run_summary(kanban_home):
         conn.close()
 
 
+def test_build_worker_context_preserves_conflicting_parent_summaries(kanban_home):
+    """Transport should surface contradictory parent handoffs verbatim so
+    downstream provenance resolution can fail closed instead of silently
+    flattening the conflict away."""
+    conn = kb.connect()
+    try:
+        parent_a = kb.create_task(conn, title="research-a", assignee="researcher")
+        parent_b = kb.create_task(conn, title="research-b", assignee="researcher")
+        child = kb.create_task(
+            conn,
+            title="orchestrate",
+            assignee="writer",
+            parents=[parent_a, parent_b],
+        )
+
+        kb.claim_task(conn, parent_a)
+        kb.complete_task(
+            conn,
+            parent_a,
+            summary="Target: Example Target",
+            metadata={"provenance": {"target": "Example Target", "resolution": "resolved"}},
+        )
+        kb.claim_task(conn, parent_b)
+        kb.complete_task(
+            conn,
+            parent_b,
+            summary="Target: Other Target",
+            metadata={"provenance": {"target": "Other Target", "resolution": "resolved"}},
+        )
+
+        ctx = kb.build_worker_context(conn, child)
+        assert "## Parent task results" in ctx
+        assert "### " + parent_a in ctx
+        assert "### " + parent_b in ctx
+        assert "Target: Example Target" in ctx
+        assert "Target: Other Target" in ctx
+    finally:
+        conn.close()
+
+
+
+def test_build_worker_context_sparse_handoff_is_truncated_with_provenance_intact(
+    kanban_home, monkeypatch
+):
+    """Even when parent summary/metadata are capped, the transport should keep
+    provenance keys visible so sparse handoffs still carry fail-closed clues."""
+    monkeypatch.setattr(kb, "_CTX_MAX_FIELD_BYTES", 160)
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="research", assignee="researcher")
+        child = kb.create_task(conn, title="orchestrate", assignee="writer", parents=[parent])
+
+        kb.claim_task(conn, parent)
+        kb.complete_task(
+            conn,
+            parent,
+            summary=(
+                "Sparse notes. " * 20
+                + "Target: Example Target\n"
+                + "Normalized target: example target\n"
+                + "Resolution: resolved"
+            ),
+            metadata={
+                "provenance": {
+                    "target": "Example Target",
+                    "target_normalized": "example target",
+                    "resolution": "resolved",
+                },
+                "padding": "X" * 400,
+            },
+        )
+
+        ctx = kb.build_worker_context(conn, child)
+        assert '"target": "Example Target"' in ctx
+        assert '"target_normalized": "example target"' in ctx
+        assert '"resolution": "resolved"' in ctx
+        assert "_provenance_:" in ctx
+        assert "[truncated," in ctx
+    finally:
+        conn.close()
+
+
 def test_migration_backfills_inflight_run_for_legacy_db(kanban_home):
     """An existing 'running' task from before task_runs existed should
     get a synthesized run row so subsequent operations (complete,

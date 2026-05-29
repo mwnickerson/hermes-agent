@@ -1887,6 +1887,7 @@ def create_task(
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
+    _assert_live_board_write_allowed(conn, title=title, created_by=created_by)
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
@@ -6464,6 +6465,12 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
 
             if run is not None and run.metadata:
                 try:
+                    provenance = None
+                    if isinstance(run.metadata, dict):
+                        provenance = run.metadata.get("provenance")
+                    if provenance:
+                        prov_str = json.dumps(provenance, ensure_ascii=False, sort_keys=True)
+                        body_lines.append(f"_provenance_: `{_cap(prov_str)}`")
                     meta_str = json.dumps(run.metadata, ensure_ascii=False, sort_keys=True)
                     body_lines.append(f"_metadata_: `{_cap(meta_str)}`")
                 except Exception:
