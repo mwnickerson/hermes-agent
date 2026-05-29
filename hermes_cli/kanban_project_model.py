@@ -19,11 +19,45 @@ PROJECT_BODY_MARKER_RE = re.compile(r"^Project Hub slug:\s*(?P<slug>[a-zA-Z0-9][
 THREAD_BODY_MARKER_RE = re.compile(r"^Discord thread id:\s*(?P<thread>[0-9]{6,})\s*$", re.M)
 ROOT_BODY_MARKER_RE = re.compile(r"^Kanban root task id:\s*(?P<root>t_[a-f0-9]+|[A-Za-z0-9_-]+)\s*$", re.M)
 STAGE_BODY_MARKER_RE = re.compile(r"^Kanban stage:\s*(?P<stage>.+?)\s*$", re.M)
+RUN_KEY_BODY_MARKER_RE = re.compile(r"^Run key:\s*(?P<run_key>.+?)\s*$", re.M)
 
 ROUTINE_EVENT_KINDS = {"created", "promoted", "claimed", "spawned", "heartbeat", "unblocked", "archived"}
 THREAD_EVENT_KINDS = {"completed", "blocked", "failed", "crashed", "timed_out", "spawn_failed", "gave_up", "commented"}
 PROJECT_EVENT_KINDS = {"project_kickoff", "project_stage_started", "project_stage_completed", "project_final_summary", "project_blocked", "project_review"}
 DANGER_EVENT_KINDS = {"blocked", "failed", "crashed", "timed_out", "spawn_failed", "gave_up"}
+
+
+def project_thread_key(project: dict[str, Any]) -> str:
+    """Return the stable Discord state key for one Project Hub run.
+
+    Project Hub slug identifies the long-lived project. Build Lane can run the
+    same project repeatedly, so Discord forum state must include run_key when it
+    is present; otherwise a new run reuses/collapses into an old forum post.
+    """
+    slug = str(project.get("project_hub_slug") or "").strip()
+    run_key = str(project.get("run_key") or project.get("execution_wave_id") or "").strip()
+    return f"{slug}:{run_key}" if run_key else slug
+
+
+def format_project_thread_starter(project: dict[str, Any]) -> str:
+    """Format the first message for a project-run Discord forum post."""
+    slug = project.get("project_hub_slug") or "unknown-project"
+    root_id = project.get("kanban_root_task_id") or "unknown-root"
+    stage = project.get("stage_name") or project.get("stage") or "unknown-stage"
+    run_key = project.get("run_key") or project.get("execution_wave_id") or "default"
+    task_ids = project.get("task_ids") or []
+    tracked = len(task_ids) if isinstance(task_ids, list) else int(project.get("task_count") or 0)
+    dsr_visible = bool(project.get("dsr_visible") or project.get("dsr_include"))
+    dsr_text = "eligible for DSR/project activity" if dsr_visible else "not DSR-visible unless later user-visible metadata opts in"
+    return (
+        f"Build Lane project run opened: {project.get('project_title') or slug}\n"
+        f"Project Hub slug: `{slug}`\n"
+        f"Root task: `{root_id}`\n"
+        f"Current stage: `{stage}`\n"
+        f"Run key: `{run_key}`\n"
+        f"Tracked tasks: `{tracked}`\n"
+        f"DSR: {dsr_text}"
+    )[:1800]
 
 
 def _json_loads(raw: Any, default: Any = None) -> Any:
@@ -80,6 +114,7 @@ def extract_task_project_metadata(task: dict[str, Any], payload: dict[str, Any] 
         "project_status": ("project_status", "status"),
         "stage_name": ("stage_name", "stage", "stage_id"),
         "execution_wave_id": ("execution_wave_id", "wave_id"),
+        "run_key": ("run_key", "project_run_key"),
         "dsr_visible": ("dsr_visible", "dsr_include"),
     }
     for target, keys in aliases.items():
@@ -92,6 +127,7 @@ def extract_task_project_metadata(task: dict[str, Any], payload: dict[str, Any] 
     out.setdefault("discord_thread_id", _body_marker(body, THREAD_BODY_MARKER_RE))
     out.setdefault("kanban_root_task_id", _body_marker(body, ROOT_BODY_MARKER_RE))
     out.setdefault("stage_name", _body_marker(body, STAGE_BODY_MARKER_RE))
+    out.setdefault("run_key", _body_marker(body, RUN_KEY_BODY_MARKER_RE))
     if out.get("project_title") in (None, "") and out.get("project_hub_slug"):
         out["project_title"] = task.get("title") or out.get("project_hub_slug")
     if out.get("kanban_root_task_id") in (None, "") and out.get("project_hub_slug"):
@@ -354,6 +390,76 @@ def archive_completed_project_tasks(con: sqlite3.Connection, older_than_seconds:
 
 def dsr_project_activity(con: sqlite3.Connection, start_ts: int, end_ts: int, limit: int = 20) -> list[dict[str, Any]]:
     con.row_factory = sqlite3.Row
+    out: list[dict[str, Any]] = []
+
+    dsr_event_kinds = sorted(PROJECT_EVENT_KINDS | {"completed", "commented"})
+    event_rows = con.execute(
+        """
+        SELECT e.id AS event_id, e.task_id, e.kind, e.payload, e.created_at,
+               t.title, t.body, t.assignee, t.status, t.result
+        FROM task_events e
+        LEFT JOIN tasks t ON t.id=e.task_id
+        WHERE e.created_at >= ? AND e.created_at < ? AND e.kind IN (%s)
+        ORDER BY e.created_at DESC, e.id DESC
+        LIMIT ?
+        """ % ",".join("?" for _ in dsr_event_kinds),
+        (start_ts, end_ts, *dsr_event_kinds, limit * 4),
+    ).fetchall()
+    for row in event_rows:
+        event = dict(row)
+        payload = _json_loads(event.get("payload"), {}) or {}
+        if not isinstance(payload, dict):
+            payload = {}
+        payload_meta = _meta_from_payload(payload)
+        visible = bool(
+            payload.get("dsr_visible")
+            or payload.get("dsr_include")
+            or payload_meta.get("dsr_visible")
+            or payload_meta.get("dsr_include")
+            or payload_meta.get("user_visible_change")
+            or payload_meta.get("project_final")
+            or payload_meta.get("project_completion")
+            or (event.get("kind") == "commented" and should_post_project_thread_event("commented", payload))
+        )
+        if not visible:
+            continue
+        task = {
+            "id": event.get("task_id"),
+            "title": event.get("title"),
+            "body": event.get("body"),
+            "assignee": event.get("assignee"),
+            "status": event.get("status"),
+            "result": event.get("result"),
+        }
+        meta = extract_task_project_metadata(task, payload)
+        if not meta.get("project_hub_slug"):
+            continue
+        event_kind = event.get("kind")
+        comment_body = payload.get("body") or payload.get("comment")
+        summary = payload_meta.get("dsr_summary") or payload.get("summary") or event.get("result") or event_kind
+        if event_kind == "commented" and comment_body:
+            summary = str(comment_body)
+        event_metadata = {
+            **payload_meta,
+            **{k: v for k, v in payload.items() if k in {"stage", "stage_name", "run_key", "work_kind", "dsr_visible", "dsr_include"}},
+        }
+        if event_kind == "commented" and comment_body:
+            event_metadata["body"] = str(comment_body)
+        out.append({
+            "project_hub_slug": meta.get("project_hub_slug"),
+            "project_title": meta.get("project_title") or event.get("title"),
+            "task_id": event.get("task_id"),
+            "title": event.get("title"),
+            "assignee": event.get("assignee"),
+            "summary": summary,
+            "completed_at": event.get("created_at"),
+            "metadata": event_metadata,
+            "event_id": event.get("event_id"),
+            "event_kind": event_kind,
+        })
+        if len(out) >= limit:
+            return out
+
     rows = con.execute(
         """
         SELECT t.*, r.summary AS run_summary, r.metadata AS run_metadata, r.outcome AS run_outcome
@@ -367,7 +473,6 @@ def dsr_project_activity(con: sqlite3.Connection, start_ts: int, end_ts: int, li
         """,
         (start_ts, end_ts, limit * 4),
     ).fetchall()
-    out = []
     for row in rows:
         task = dict(row)
         payload_meta = _json_loads(task.get("run_metadata"), {}) or {}
@@ -399,6 +504,8 @@ __all__ = [
     "project_metadata_markers",
     "resolve_project_context",
     "should_post_project_thread_event",
+    "project_thread_key",
+    "format_project_thread_starter",
     "format_project_thread_update",
     "project_rows",
     "archive_completed_project_tasks",

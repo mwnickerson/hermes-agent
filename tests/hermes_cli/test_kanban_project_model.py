@@ -77,6 +77,97 @@ def test_dsr_project_activity_only_user_visible():
     assert rows[0]["summary"] == "Visible outcome"
 
 
+def test_dsr_project_activity_includes_visible_project_events():
+    con = make_db()
+    now = int(time.time())
+    body = "Project Hub slug: build-implementation-lane\nKanban root task id: root\nKanban stage: build-lane-root\n"
+    con.execute("INSERT INTO tasks(id,title,body,assignee,status,created_at) VALUES (?,?,?,?,?,?)", ("root", "Build Lane run", body, "antonetta", "done", now - 10))
+    con.execute(
+        "INSERT INTO task_events(task_id,kind,payload,created_at) VALUES (?,?,?,?)",
+        ("root", "project_stage_started", json.dumps({
+            "project_hub_slug": "build-implementation-lane",
+            "project_title": "Run 3",
+            "kanban_root_task_id": "root",
+            "stage": "build-lane-root",
+            "run_key": "run-3-forum-dsr-visibility",
+            "summary": "Build Lane Kanban graph initialized.",
+            "dsr_visible": True,
+        }), now - 5),
+    )
+    rows = kpm.dsr_project_activity(con, now - 100, now + 100)
+    assert rows[0]["task_id"] == "root"
+    assert rows[0]["project_hub_slug"] == "build-implementation-lane"
+    assert rows[0]["summary"] == "Build Lane Kanban graph initialized."
+    assert rows[0]["metadata"]["run_key"] == "run-3-forum-dsr-visibility"
+    assert rows[0]["event_kind"] == "project_stage_started"
+
+
+def test_project_thread_key_and_starter_are_run_keyed():
+    project = {
+        "project_hub_slug": "build-implementation-lane",
+        "project_title": "Run 3",
+        "kanban_root_task_id": "t_root",
+        "stage_name": "build-lane-root",
+        "run_key": "run-3-forum-dsr-visibility",
+        "task_ids": ["t_root", "t_child"],
+        "dsr_visible": True,
+    }
+    assert kpm.project_thread_key(project) == "build-implementation-lane:run-3-forum-dsr-visibility"
+    starter = kpm.format_project_thread_starter(project)
+    assert "Project Hub slug: `build-implementation-lane`" in starter
+    assert "Root task: `t_root`" in starter
+    assert "Current stage: `build-lane-root`" in starter
+    assert "Run key: `run-3-forum-dsr-visibility`" in starter
+    assert "Tracked tasks: `2`" in starter
+    assert "eligible for DSR/project activity" in starter
+
+
+def test_dsr_project_activity_includes_completed_metadata():
+    con = make_db()
+    now = int(time.time())
+    body = "Project Hub slug: build-implementation-lane\nKanban root task id: root\n"
+    con.execute("INSERT INTO tasks(id,title,body,assignee,status,created_at,completed_at,result) VALUES (?,?,?,?,?,?,?,?)", ("worker", "Build worker", body, "forge", "done", now - 20, now - 5, "worker result"))
+    con.execute(
+        "INSERT INTO task_events(task_id,kind,payload,created_at) VALUES (?,?,?,?)",
+        ("worker", "completed", json.dumps({
+            "summary": "worker completed",
+            "metadata": {
+                "project_hub_slug": "build-implementation-lane",
+                "run_key": "run-4",
+                "dsr_visible": True,
+                "dsr_summary": "Visible worker completion",
+                "changed_files": ["hermes_cli/kanban_project_model.py"],
+            },
+        }), now - 4),
+    )
+    rows = kpm.dsr_project_activity(con, now - 100, now + 100)
+    assert rows[0]["event_kind"] == "completed"
+    assert rows[0]["summary"] == "Visible worker completion"
+    assert rows[0]["metadata"]["changed_files"] == ["hermes_cli/kanban_project_model.py"]
+    assert rows[0]["metadata"]["run_key"] == "run-4"
+
+
+def test_dsr_project_activity_includes_relevant_comment_body():
+    con = make_db()
+    now = int(time.time())
+    body = "Project Hub slug: build-implementation-lane\nKanban root task id: root\n"
+    con.execute("INSERT INTO tasks(id,title,body,assignee,status,created_at) VALUES (?,?,?,?,?,?)", ("review", "Review gate", body, "reviewer", "blocked", now - 20))
+    con.execute(
+        "INSERT INTO task_events(task_id,kind,payload,created_at) VALUES (?,?,?,?)",
+        ("review", "commented", json.dumps({
+            "body": "review-required: watcher smoke-test passes; please verify DSR visibility",
+            "metadata": {
+                "project_hub_slug": "build-implementation-lane",
+                "run_key": "run-4",
+            },
+        }), now - 4),
+    )
+    rows = kpm.dsr_project_activity(con, now - 100, now + 100)
+    assert rows[0]["event_kind"] == "commented"
+    assert rows[0]["summary"] == "review-required: watcher smoke-test passes; please verify DSR visibility"
+    assert rows[0]["metadata"]["body"] == "review-required: watcher smoke-test passes; please verify DSR visibility"
+
+
 def test_completed_project_thread_posts_are_metadata_gated():
     assert kpm.should_post_project_thread_event(
         "completed",
