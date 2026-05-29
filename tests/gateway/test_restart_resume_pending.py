@@ -32,7 +32,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import GatewayConfig, HomeChannel, Platform
+from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.run import (
     _auto_continue_freshness_window,
@@ -1098,6 +1098,51 @@ async def test_restart_notifies_home_channel_even_without_active_sessions():
         "⚠️ Gateway restarting — Your current task will be interrupted. "
         "Send any message after restart and I'll try to resume where you left off."
     ]
+
+
+@pytest.mark.asyncio
+async def test_restart_discord_home_notification_prefers_system_channel(monkeypatch):
+    runner, adapter = make_restart_runner()
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner.config.platforms = {Platform.DISCORD: PlatformConfig(enabled=True, token="***")}
+    runner.config.platforms[Platform.DISCORD].home_channel = HomeChannel(
+        platform=Platform.DISCORD,
+        chat_id="ori-runs-home",
+        name="ORI Runs",
+    )
+    monkeypatch.setenv("DISCORD_SYSTEM_CHANNEL", "gateway-restarts")
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    sent = getattr(adapter, "sent")
+    sent_calls = getattr(adapter, "sent_calls")
+    assert sent_calls == [("gateway-restarts", sent[0], None)]
+
+
+@pytest.mark.asyncio
+async def test_restart_discord_active_session_prefers_system_channel(monkeypatch):
+    runner, adapter = make_restart_runner()
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner.config.platforms = {Platform.DISCORD: PlatformConfig(enabled=True, token="***")}
+    session_key = "agent:main:discord:group:ori-runs"
+    runner.session_store._entries[session_key] = MagicMock(
+        origin=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="ori-runs",
+            chat_type="group",
+            user_id="u1",
+            thread_id="ori-thread",
+        )
+    )
+    runner._running_agents[session_key] = MagicMock()
+    monkeypatch.setenv("DISCORD_SYSTEM_CHANNEL", "gateway-restarts")
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    sent = getattr(adapter, "sent")
+    sent_calls = getattr(adapter, "sent_calls")
+    assert len(sent) == 1
+    assert sent_calls == [("gateway-restarts", sent[0], None)]
 
 
 @pytest.mark.asyncio

@@ -3486,6 +3486,16 @@ class GatewayRunner:
                 chat_id = _parsed["chat_id"]
                 thread_id = _parsed.get("thread_id")
 
+            # Discord lifecycle notices are operator/system noise, not work-thread
+            # content.  Route them to DISCORD_SYSTEM_CHANNEL when configured so
+            # forum surfaces such as ORI runs do not get polluted by restart
+            # threads from active-session interruption notices.
+            if platform_str == Platform.DISCORD.value:
+                system_chat_id = (os.getenv("DISCORD_SYSTEM_CHANNEL") or "").strip()
+                if system_chat_id:
+                    chat_id = system_chat_id
+                    thread_id = None
+
             # Deduplicate only identical delivery targets. Thread/topic-aware
             # platforms can share a parent chat while still routing to distinct
             # destinations via metadata.
@@ -3539,47 +3549,58 @@ class GatewayRunner:
         # observed in a user report during gateway shutdown.
         for platform, adapter in list(self.adapters.items()):
             home = self.config.get_home_channel(platform)
-            if not home or not home.chat_id:
+            system_chat_id = None
+            if platform == Platform.DISCORD:
+                system_chat_id = (os.getenv("DISCORD_SYSTEM_CHANNEL") or "").strip() or None
+
+            target_chat_id = system_chat_id or (str(home.chat_id) if home and home.chat_id else None)
+            target_thread_id = None if system_chat_id else (home.thread_id if home else None)
+            target_label = "system channel" if system_chat_id else "home channel"
+            if not target_chat_id:
                 continue
 
             platform_cfg = self.config.platforms.get(platform)
             if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
                 logger.info(
-                    "Shutdown notification suppressed for home channel: %s has gateway_restart_notification=false",
+                    "Shutdown notification suppressed for %s: %s has gateway_restart_notification=false",
+                    target_label,
                     platform.value,
                 )
                 continue
 
-            dedup_key = (platform.value, str(home.chat_id), str(home.thread_id) if home.thread_id else None)
+            dedup_key = (platform.value, str(target_chat_id), str(target_thread_id) if target_thread_id else None)
             if dedup_key in notified:
                 continue
 
             try:
-                metadata = {"thread_id": home.thread_id} if home.thread_id else None
+                metadata = {"thread_id": target_thread_id} if target_thread_id else None
                 if metadata:
-                    result = await adapter.send(str(home.chat_id), msg, metadata=metadata)
+                    result = await adapter.send(str(target_chat_id), msg, metadata=metadata)
                 else:
-                    result = await adapter.send(str(home.chat_id), msg)
+                    result = await adapter.send(str(target_chat_id), msg)
                 if result is not None and getattr(result, "success", True) is False:
                     logger.debug(
-                        "Failed to send shutdown notification to home channel %s:%s: %s",
+                        "Failed to send shutdown notification to %s %s:%s: %s",
+                        target_label,
                         platform.value,
-                        home.chat_id,
+                        target_chat_id,
                         getattr(result, "error", "send returned success=False"),
                     )
                     continue
 
                 notified.add(dedup_key)
                 logger.info(
-                    "Sent shutdown notification to home channel %s:%s",
+                    "Sent shutdown notification to %s %s:%s",
+                    target_label,
                     platform.value,
-                    home.chat_id,
+                    target_chat_id,
                 )
             except Exception as e:
                 logger.debug(
-                    "Failed to send shutdown notification to home channel %s:%s: %s",
+                    "Failed to send shutdown notification to %s %s:%s: %s",
+                    target_label,
                     platform.value,
-                    home.chat_id,
+                    target_chat_id,
                     e,
                 )
 
