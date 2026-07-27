@@ -2150,6 +2150,80 @@ def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):
     assert _list_subs_for_task(d["task_id"]) == []
 
 
+def test_worker_created_child_inherits_origin_subscription(monkeypatch, worker_env):
+    """Delegated fan-out must keep the original human in the loop."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    parent_id = worker_env
+    conn = kb.connect()
+    try:
+        kb.add_notify_sub(
+            conn,
+            task_id=parent_id,
+            platform="telegram",
+            chat_id="origin-chat",
+            thread_id="origin-thread",
+            user_id="origin-user",
+            notifier_profile="default",
+        )
+    finally:
+        conn.close()
+
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+
+    out = kt._handle_create({
+        "title": "delegated child",
+        "assignee": "peer",
+        "parents": [parent_id],
+    })
+    data = json.loads(out)
+
+    assert data["ok"] is True
+    assert data["subscribed"] is True
+    subs = _sub_index(_list_subs_for_task(data["task_id"]))
+    assert len(subs) == 1
+    assert subs[0]["platform"] == "telegram"
+    assert subs[0]["chat_id"] == "origin-chat"
+    assert subs[0]["thread_id"] == "origin-thread"
+    assert subs[0]["user_id"] == "origin-user"
+    assert subs[0]["notifier_profile"] == "default"
+
+
+def test_worker_created_child_inherits_origin_session_id(monkeypatch, worker_env):
+    """Completion wakeups target the human's session, not the worker run."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET session_id = ? WHERE id = ?",
+            ("origin-session", worker_env),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "worker-session")
+    out = kt._handle_create({
+        "title": "session-aware child",
+        "assignee": "peer",
+        "parents": [worker_env],
+    })
+    data = json.loads(out)
+
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, data["task_id"])
+    finally:
+        conn.close()
+    assert child is not None
+    assert child.session_id == "origin-session"
+
+
 def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env, tmp_path):
     """The config gate kanban.auto_subscribe_on_create=false must
     suppress auto-subscription even when the session has a delivery

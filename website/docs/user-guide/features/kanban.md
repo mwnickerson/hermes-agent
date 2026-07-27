@@ -508,7 +508,7 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `auto_decompose_per_tick` | `3` | Cap on decompositions per dispatcher tick. Excess defers to the next tick. |
 | `orchestrator_profile` | `""` | Profile assigned to the root/orchestration task after decomposition. Empty = fall back to active default profile. |
 | `default_assignee` | `""` | Where a child task lands when the LLM picks an unknown profile. Empty = fall back to active default. |
-| `auto_subscribe_on_create` | `true` | When a worker calls `kanban_create` from inside a session with a persistent delivery channel (messaging gateway or TUI), the originating session is auto-subscribed to the new task's completion/block events. The dispatcher still drives the delivery — this only changes whether the caller's chat/key shows up in the notify-sub table. Set to `false` to require explicit `kanban_notify-subscribe` calls per task. |
+| `auto_subscribe_on_create` | `true` | When a worker calls `kanban_create`, the originating gateway/TUI session is auto-subscribed to completion/block events. Dispatcher workers inherit the running task's routes, so the contract continues through nested delegation and across profiles instead of stopping at the first orchestrator. The dispatcher still drives delivery. Set to `false` to require explicit `kanban_notify-subscribe` calls per task. |
 
 And the two auxiliary LLM slots:
 
@@ -764,6 +764,14 @@ This is the whole point of the separation:
 ### Auto-subscribe on `/kanban create` (gateway only)
 
 When you create a task from the gateway with `/kanban create "…"`, the originating chat (platform + chat id + thread id) is automatically subscribed to that task's terminal events (`completed`, `blocked`, `gave_up`, `crashed`, `timed_out`). You'll get one message back per terminal event — including the first line of the worker's result summary on `completed` — without having to poll or remember the task id.
+
+The subscription follows delegated work. If an orchestrator or worker creates
+child tasks, each child inherits the original notification routes and owning
+profile. Nested and cross-profile Kanban work therefore reports completion to
+the same human channel even though dispatcher-spawned workers do not retain the
+gateway's live session context. The origin session id is inherited as well, so
+agent wakeups return to the commissioning conversation rather than a transient
+worker session.
 
 ```
 you> /kanban create "transcribe today's podcast" --assignee transcriber

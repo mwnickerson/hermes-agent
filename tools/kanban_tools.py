@@ -895,19 +895,21 @@ def _handle_create(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            # Inherit the spawning worker's own task workspace when the
-            # caller didn't specify one (see resolution note above).
+            # Inherit origin/session and workspace from the spawning worker's
+            # own task. A worker's HERMES_SESSION_ID identifies the transient
+            # worker run, not the human session that commissioned the tree.
+            _self_tid = os.environ.get("HERMES_KANBAN_TASK")
+            _self_task = kb.get_task(conn, _self_tid) if _self_tid else None
+            if _self_task is not None and not args.get("session_id"):
+                session_id = _self_task.session_id or session_id
             if _inherit_workspace:
-                _self_tid = os.environ.get("HERMES_KANBAN_TASK")
-                if _self_tid:
-                    _self_task = kb.get_task(conn, _self_tid)
-                    if _self_task is not None and _self_task.workspace_kind:
-                        workspace_kind = _self_task.workspace_kind
-                        workspace_path = _self_task.workspace_path
-                        # Keep follow-up children inside the same project so the
-                        # whole subtree shares one repo + branch convention.
-                        if project_id is None and _self_task.project_id:
-                            project_id = _self_task.project_id
+                if _self_task is not None and _self_task.workspace_kind:
+                    workspace_kind = _self_task.workspace_kind
+                    workspace_path = _self_task.workspace_path
+                    # Keep follow-up children inside the same project so the
+                    # whole subtree shares one repo + branch convention.
+                    if project_id is None and _self_task.project_id:
+                        project_id = _self_task.project_id
             new_tid = kb.create_task(
                 conn,
                 title=str(title).strip(),
@@ -935,7 +937,12 @@ def _handle_create(args: dict, **kw) -> str:
                 session_id=session_id,
             )
             new_task = kb.get_task(conn, new_tid)
-            subscribed = _maybe_auto_subscribe(conn, new_tid)
+            subscription_sources = list(dict.fromkeys(
+                [source for source in [_self_tid, *parents] if source]
+            ))
+            subscribed = _maybe_auto_subscribe(
+                conn, new_tid, inherit_from=subscription_sources,
+            )
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
@@ -950,7 +957,12 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(f"kanban_create: {e}")
 
 
-def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
+def _maybe_auto_subscribe(
+    conn: Any,
+    task_id: str,
+    *,
+    inherit_from: Optional[list[str]] = None,
+) -> bool:
     """Auto-subscribe the calling session to task completion / block events.
 
     Returns True if a subscription row was written, False otherwise (no
@@ -980,8 +992,12 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
       for these rows and posts the completion message into the running
       session.
 
-    - **CLI / cron / test / unattached**: no persistent delivery channel,
-      no-op.
+    - **Dispatcher workers**: no direct delivery channel. Routes are copied
+      from the running task and declared parents so notifications continue
+      through every level of delegated Kanban fan-out.
+
+    - **CLI / cron / test / unattached**: no persistent delivery channel and
+      no subscribed parent, no-op.
 
     Failure mode: any exception inside the function is logged at WARNING
     with the offending exception + diagnostic env vars and swallowed.
@@ -996,6 +1012,29 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         # If config can't load we still default to True — this is the
         # user-friendly behaviour that mirrors the pre-gate implementation.
         pass
+
+    # Copy upstream routes first even if this process also carries a delivery
+    # context. This preserves the original human/profile through nested fan-out
+    # while allowing an attached worker session to observe the child too.
+    inherited = False
+    try:
+        from hermes_cli import kanban_db as _kb
+        for source_id in inherit_from or []:
+            for sub in _kb.list_notify_subs(conn, source_id):
+                _kb.add_notify_sub(
+                    conn,
+                    task_id=task_id,
+                    platform=sub["platform"],
+                    chat_id=sub["chat_id"],
+                    thread_id=sub.get("thread_id") or None,
+                    user_id=sub.get("user_id"),
+                    notifier_profile=sub.get("notifier_profile"),
+                )
+                inherited = True
+    except Exception as _exc:
+        logger.warning(
+            "notification inheritance failed for %s: %r", task_id, _exc,
+        )
 
     platform = ""
     chat_id = ""
@@ -1021,10 +1060,11 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
                 get_session_env("HERMES_SESSION_KEY", "")
                 or os.environ.get("HERMES_SESSION_KEY", "")
             )
-            if not session_key:
-                return False  # CLI / cron / test — no persistent channel
-            platform = "tui"
-            chat_id = session_key
+            if session_key:
+                platform = "tui"
+                chat_id = session_key
+            else:
+                return inherited
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
         notifier_profile = (
@@ -1046,7 +1086,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             "_maybe_auto_subscribe failed: %r (platform=%r key_set=%r)",
             _exc, platform, bool(chat_id),
         )
-        return False
+        return inherited
 
 
 def _handle_unblock(args: dict, **kw) -> str:
