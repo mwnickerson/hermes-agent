@@ -361,9 +361,14 @@ class GatewayKanbanWatchersMixin:
                                 lines = task.result.strip().splitlines()
                                 r = lines[0][:160] if lines else task.result[:160]
                                 handoff = f"\n{r}"
+                            inspect_ref = (
+                                f"\nInspect: board {board_slug} / task {sub['task_id']}"
+                                if board_slug
+                                else f"\nInspect: task {sub['task_id']}"
+                            )
                             msg = (
-                                f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
-                                f" — {title}{handoff}"
+                                f"✔ {board_tag}{tag}Kanban {sub['task_id']} succeeded"
+                                f" — {title}{handoff}{inspect_ref}"
                             )
                         elif kind == "blocked":
                             reason = ""

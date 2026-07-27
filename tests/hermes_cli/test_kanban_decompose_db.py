@@ -68,6 +68,52 @@ def test_decompose_creates_children_and_promotes_root(kanban_home):
     assert c1.assignee == "engineer"
 
 
+def test_decompose_children_inherit_origin_session_and_notification_route(kanban_home):
+    """Auto-decomposition must not lose the human return route."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="commissioned work",
+            assignee="orchestrator",
+            triage=True,
+            session_id="origin-session",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="discord",
+            chat_id="channel-42",
+            thread_id="thread-7",
+            user_id="user-9",
+            notifier_profile="default",
+        )
+
+        child_ids = kb.decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="orchestrator",
+            children=[
+                {"title": "research"},
+                {"title": "implement", "parents": [0]},
+            ],
+            author="auto-decomposer",
+        )
+
+        assert child_ids is not None
+        for child_id in child_ids:
+            child = kb.get_task(conn, child_id)
+            assert child is not None
+            assert child.session_id == "origin-session"
+            subs = kb.list_notify_subs(conn, child_id)
+            assert len(subs) == 1
+            sub = subs[0]
+            assert sub["platform"] == "discord"
+            assert sub["chat_id"] == "channel-42"
+            assert sub["thread_id"] == "thread-7"
+            assert sub["user_id"] == "user-9"
+            assert sub["notifier_profile"] == "default"
+
+
 def test_decompose_returns_none_when_task_missing(kanban_home):
     with kb.connect() as conn:
         result = kb.decompose_triage_task(

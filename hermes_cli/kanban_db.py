@@ -5074,7 +5074,7 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, session_id "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -5089,6 +5089,12 @@ def decompose_triage_task(
         # override with its own 'workspace_kind' / 'workspace_path'.
         root_ws_kind = root_row["workspace_kind"] or "scratch"
         root_ws_path = root_row["workspace_path"]
+        root_session_id = root_row["session_id"]
+        root_subscriptions = conn.execute(
+            "SELECT platform, chat_id, thread_id, user_id, notifier_profile "
+            "FROM kanban_notify_subs WHERE task_id = ?",
+            (task_id,),
+        ).fetchall()
 
         # Create children. Status is 'todo' regardless of parents — we
         # link them under the root AFTER creation so the dispatcher
@@ -5114,8 +5120,8 @@ def decompose_triage_task(
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, tenant, created_at, created_by, session_id) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -5126,6 +5132,7 @@ def decompose_triage_task(
                     tenant,
                     now,
                     (author or "decomposer"),
+                    root_session_id,
                 ),
             )
             _append_event(
@@ -5133,6 +5140,26 @@ def decompose_triage_task(
                 {"by": author or "decomposer", "from_decompose_of": task_id},
             )
             child_ids.append(new_id)
+
+            # This DB-level fan-out bypasses the kanban_create tool's route
+            # inheritance. Copy the root's explicit subscriptions atomically
+            # so auto-decomposed work can still notify its commissioning human.
+            for sub in root_subscriptions:
+                conn.execute(
+                    "INSERT OR IGNORE INTO kanban_notify_subs "
+                    "(task_id, platform, chat_id, thread_id, user_id, "
+                    " notifier_profile, created_at, last_event_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
+                    (
+                        new_id,
+                        sub["platform"],
+                        sub["chat_id"],
+                        sub["thread_id"] or "",
+                        sub["user_id"],
+                        sub["notifier_profile"],
+                        now,
+                    ),
+                )
 
         # Link children to their sibling parents (within the decomposed graph).
         for idx, child in enumerate(children):
