@@ -105,6 +105,9 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
 from gateway.config import Platform, PlatformConfig
+from hermes_cli.discord_presentation import (
+    render_discord_human_text,
+)
 
 from gateway.platforms.helpers import MessageDeduplicator, ThreadParticipationTracker, convert_table_to_bullets
 from utils import atomic_json_write, env_float, env_int
@@ -2004,6 +2007,14 @@ class DiscordAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
+            rendered = render_discord_human_text(content, metadata=metadata)
+            if not rendered.allowed:
+                logger.info(
+                    "[%s] Discord outbound text suppressed by presentation boundary: %s",
+                    self.name,
+                    rendered.reason,
+                )
+            content = rendered.text
             # Determine target channel: thread_id in metadata takes precedence.
             thread_id = None
             if metadata and metadata.get("thread_id"):
@@ -2027,7 +2038,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
-                return await self._send_to_forum(channel, content)
+                return await self._send_to_forum(channel, content, metadata=metadata)
 
             # Format and split message if needed
             formatted = self.format_message(content)
@@ -2101,7 +2112,12 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
-    async def _send_to_forum(self, forum_channel: Any, content: str) -> SendResult:
+    async def _send_to_forum(
+        self,
+        forum_channel: Any,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
         """Create a thread post in a forum channel with the message as starter content.
 
         Forum channels (type 15) don't support direct messages.  Instead we
@@ -2113,6 +2129,14 @@ class DiscordAdapter(BasePlatformAdapter):
         # _derive_forum_thread_name is defined further down in this same
         # module — no cross-module import needed.
 
+        rendered = render_discord_human_text(content, metadata=metadata)
+        if not rendered.allowed:
+            logger.info(
+                "[%s] Discord forum starter suppressed by presentation boundary: %s",
+                self.name,
+                rendered.reason,
+            )
+        content = rendered.text
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
@@ -2176,6 +2200,16 @@ class DiscordAdapter(BasePlatformAdapter):
         # _derive_forum_thread_name is defined further down in this same
         # module — no cross-module import needed.
 
+        if content:
+            rendered = render_discord_human_text(content, metadata={})
+            if not rendered.allowed:
+                logger.info(
+                    "[%s] Discord forum file caption suppressed by presentation boundary: %s",
+                    self.name,
+                    rendered.reason,
+                )
+            content = rendered.text
+
         if not thread_name:
             # Prefer the text content, fall back to the first attached
             # filename, fall back to the generic default.
@@ -2224,6 +2258,7 @@ class DiscordAdapter(BasePlatformAdapter):
         content: str,
         *,
         finalize: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Edit a previously sent Discord message.
 
@@ -2241,6 +2276,17 @@ class DiscordAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
         try:
+            rendered = render_discord_human_text(
+                content,
+                metadata=metadata,
+            )
+            if not rendered.allowed:
+                logger.info(
+                    "[%s] Discord edit text suppressed by presentation boundary: %s",
+                    self.name,
+                    rendered.reason,
+                )
+            content = rendered.text
             channel = self._client.get_channel(int(chat_id))
             if not channel:
                 channel = await self._client.fetch_channel(int(chat_id))
@@ -7038,6 +7084,7 @@ def _define_discord_view_classes() -> None:
                     self.session_key, self.confirm_id, choice,
                 )
                 if result_text:
+                    result_text = render_discord_human_text(result_text, metadata={}).text
                     await interaction.followup.send(result_text)
                 logger.info(
                     "Discord button resolved slash-confirm for session %s "
@@ -7396,6 +7443,7 @@ def _define_discord_view_classes() -> None:
                 )
             except Exception as exc:
                 result_text = f"Error switching model: {exc}"
+            result_text = render_discord_human_text(result_text, metadata={}).text
 
             await interaction.edit_original_response(
                 embed=discord.Embed(
@@ -7910,6 +7958,21 @@ async def _standalone_send(
         return {"error": "Discord standalone send: DISCORD_BOT_TOKEN is not set"}
 
     try:
+        rendered = render_discord_human_text(message, metadata={})
+        if not rendered.allowed:
+            logger.info(
+                "Discord standalone text suppressed by presentation boundary: %s",
+                rendered.reason,
+            )
+        message = rendered.text
+        if caption is not None:
+            rendered_caption = render_discord_human_text(caption, metadata={})
+            if not rendered_caption.allowed:
+                logger.info(
+                    "Discord standalone caption suppressed by presentation boundary: %s",
+                    rendered_caption.reason,
+                )
+            caption = rendered_caption.text
         from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
         _proxy = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
         _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)

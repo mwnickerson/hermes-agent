@@ -82,6 +82,22 @@ except ImportError:  # pragma: no cover - local deployment may predate project m
     kpm = _ProjectModelFallback()
 else:
     PROJECT_MODEL_IMPORT_ERROR = False
+
+try:
+    from hermes_cli.discord_presentation import audit_discord_human_texts, render_discord_human_text  # type: ignore
+except ImportError:  # pragma: no cover - deployed watcher may predate presentation helper
+    def render_discord_human_text(text, metadata=None):
+        return type("_Presentation", (), {
+            "text": str(text or ""),
+            "allowed": False,
+            "reason": "presentation-model-unavailable",
+        })()
+
+    def audit_discord_human_texts(texts):
+        return [
+            {"index": i, "allowed": False, "reason": "presentation-model-unavailable", "rendered": ""}
+            for i, _text in enumerate(texts)
+        ]
 try:
     from hermes_cli import kanban_discord_approvals as kap  # type: ignore
 except ImportError:  # pragma: no cover - local deployment may predate approval helpers
@@ -240,6 +256,8 @@ def post(channel_id, content, dry_run=False, components=None):
     body = content if isinstance(content, dict) else {"content": content}
     if components is not None:
         body["components"] = components
+    rendered = render_discord_human_text(body.get("content") or "", metadata={})
+    body["content"] = rendered.text
     text = str(body.get("content") or "")
     if len(text) > 1900:
         body["content"] = text[:1850] + "\n…[truncated]"
@@ -263,6 +281,8 @@ def get_channel(channel_id, dry_run=False):
 def create_thread(parent_channel_id, name, message, dry_run=False, applied_tags=None):
     parent = get_channel(parent_channel_id, dry_run=dry_run)
     parent_type = int(parent.get("type", 0) or 0)
+    rendered = render_discord_human_text(message, metadata={})
+    message = rendered.text
     body = {"name": name[:90], "auto_archive_duration": 10080, "message": {"content": message}}
     # Text channels need an explicit public-thread type. Forum/media channels
     # create posts via the same endpoint but reject/ignore the text-thread type;
@@ -291,6 +311,8 @@ def archive_thread(thread_id, dry_run=False):
 
 def post_redirect_once(thread_id, content, nonce, dry_run=False):
     """Post a redirect with Discord-enforced nonce idempotency."""
+    rendered = render_discord_human_text(content, metadata={})
+    content = rendered.text
     body = {"content": content, "nonce": str(nonce), "enforce_nonce": True}
     if dry_run:
         print(f"DRY-RUN redirect_once channel={thread_id} nonce={nonce}:\n{content}\n---")
@@ -1050,6 +1072,17 @@ def preview_fixtures():
             print(f"suppressed: {rendered.suppression_reason}")
 
 
+def audit_recent_bot_message_fixtures():
+    fixtures = [
+        "Done. The Discord presentation boundary is now active.",
+        "Here is the helper you asked for:\n```python\nprint('hello')\n```",
+        '{"stdout": "/Users/anton/.hermes/raw-output", "returncode": 1}',
+        "Traceback (most recent call last):\n  File \"/tmp/hermes.py\", line 1, in <module>",
+        "task_id: t_abcdef123456\nrun_id: 42\nmetadata: {\"raw\": true}",
+    ]
+    print(json.dumps(audit_discord_human_texts(fixtures), indent=2, sort_keys=True))
+
+
 def smoke_test():
     global DB_PATH, STATE_PATH
     old_db, old_state = DB_PATH, STATE_PATH
@@ -1106,6 +1139,7 @@ def main():
     parser.add_argument("--once", action="store_true", help="process available events once and exit")
     parser.add_argument("--smoke-test", action="store_true", help="run deterministic local smoke test without Discord")
     parser.add_argument("--preview-fixtures", action="store_true", help="render deterministic PM fixture events without Discord")
+    parser.add_argument("--audit-recent-bot-fixtures", action="store_true", help="dry-run Discord presentation audit for local bot-message fixtures")
     parser.add_argument("--migrate-printsmith-component", metavar="TASK_ID", help="explicitly migrate one leaked Printsmith component")
     args = parser.parse_args()
     if args.smoke_test:
@@ -1113,6 +1147,9 @@ def main():
         return
     if args.preview_fixtures:
         preview_fixtures()
+        return
+    if args.audit_recent_bot_fixtures:
+        audit_recent_bot_message_fixtures()
         return
 
     load_env(ENV_PATH)

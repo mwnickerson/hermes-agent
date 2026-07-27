@@ -130,7 +130,11 @@ class GatewayStreamConsumer:
         self.adapter = adapter
         self.chat_id = chat_id
         self.cfg = config or StreamConsumerConfig()
-        self.metadata = metadata
+        self.metadata = dict(metadata) if metadata else None
+        if getattr(self.adapter, "name", "").lower() == "discord":
+            self.metadata = dict(self.metadata or {})
+            self.metadata["discord_interactive_response"] = True
+            self.metadata["discord_allow_code"] = True
         # Fired whenever a fresh content bubble is created on the platform
         # (first-send of a new message, commentary, overflow chunk, or
         # fallback continuation). The gateway uses this to linearize the
@@ -232,6 +236,9 @@ class GatewayStreamConsumer:
         final-message delivery.
         """
         meta = dict(self.metadata) if self.metadata else {}
+        if getattr(self.adapter, "name", "").lower() == "discord":
+            meta["discord_interactive_response"] = True
+            meta["discord_allow_code"] = True
         if expect_edits:
             meta["expect_edits"] = True
         if final:
