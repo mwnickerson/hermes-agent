@@ -176,6 +176,25 @@ def safe_event_ref(ev):
     return hashlib.sha256(f"{ev.get('id')}:{ev.get('task_id')}:{ev.get('kind')}".encode()).hexdigest()[:12]
 
 
+def state_db_ref():
+    """Return a stable, non-secret identity for state bound to the active DB."""
+    try:
+        stat_result = DB_PATH.stat()
+        raw = f"{DB_PATH.resolve()}:{stat_result.st_dev}:{stat_result.st_ino}"
+    except OSError:
+        raw = str(DB_PATH.expanduser().resolve())
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def state_event_bucket(state, key):
+    """Return an active-DB bucket, migrating the legacy flat event-id map."""
+    container = state.setdefault(key, {})
+    if container and all(isinstance(value, dict) and "attempts" in value for value in container.values()):
+        state[key] = {state_db_ref(): container}
+        container = state[key]
+    return container.setdefault(state_db_ref(), {})
+
+
 def log_pm_decision(action, reason, ev, project_ctx=None):
     """Write structured local PM-boundary logs without raw payload content."""
     project_ctx = project_ctx or {}
@@ -502,6 +521,7 @@ def load_state():
             state.setdefault("task_aliases", {})
             state.setdefault("red_thread_posts", {})
             state.setdefault("delivery_failures", {})
+            state.setdefault("project_thread_posts", {})
             migrate_project_thread_state(state)
             return state
         except Exception:
@@ -512,6 +532,7 @@ def load_state():
         "task_aliases": {},
         "red_thread_posts": {},
         "delivery_failures": {},
+        "project_thread_posts": {},
     }
 
 
@@ -942,8 +963,20 @@ def route_event(con, state, ev, channel_id, project_channel_id, red_channel_id, 
             thread_id = thread["id"]
             state.setdefault("project_threads", {})[thread_key] = thread_id
         if should_post_project_event:
-            post(thread_id, pm_update.message, dry_run=dry_run)
-            log_pm_decision("posted", "pm-rendered", ev, project_ctx)
+            receipts = state_event_bucket(state, "project_thread_posts")
+            receipt_key = str(ev["id"])
+            if receipt_key in receipts:
+                log_pm_decision("suppressed", "duplicate-project-event-retry", ev, project_ctx)
+            else:
+                message = post(thread_id, pm_update.message, dry_run=dry_run) or {}
+                receipts[receipt_key] = {
+                    "thread_id": str(thread_id),
+                    "message_id": str(message.get("id", "")),
+                    "posted_at": int(time.time()),
+                }
+                if not dry_run:
+                    save_state(state)
+                log_pm_decision("posted", "pm-rendered", ev, project_ctx)
         if maybe_post_human_approval(task, ev, payload, thread_id, project_ctx, dry_run=dry_run):
             return "posted-human-approval"
         return "posted-project-thread" if should_post_project_event else "skipped-project-noise"
@@ -977,7 +1010,7 @@ def run_once(state, channel_id, project_channel_id, red_channel_id, dry_run=Fals
             "select id, task_id, run_id, kind, payload, created_at from task_events where id > ? order by id asc limit ?",
             (int(state.get("last_event_id", 0)), limit),
         ).fetchall()
-        failures = state.setdefault("delivery_failures", {})
+        failures = state_event_bucket(state, "delivery_failures")
         for row in rows:
             ev = dict(row)
             event_key = str(ev["id"])

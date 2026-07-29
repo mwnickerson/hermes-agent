@@ -265,7 +265,7 @@ def test_delivery_failure_is_retried_without_advancing_the_event_cursor(monkeypa
     watcher.run_once(state, "general", "project", "red", limit=1)
 
     assert state["last_event_id"] == 0
-    receipt = state["delivery_failures"]["1"]
+    receipt = state["delivery_failures"][watcher.state_db_ref()]["1"]
     assert receipt["attempts"] == 1
     assert receipt["error_class"] == "TimeoutError"
     assert "delivery transport unavailable" not in json.dumps(receipt)
@@ -284,6 +284,49 @@ def test_delivery_failure_records_exhaustion_only_after_bounded_retries(monkeypa
         watcher.run_once(state, "general", "project", "red", limit=1)
 
     assert state["last_event_id"] == 1
-    receipt = state["delivery_failures"]["1"]
+    receipt = state["delivery_failures"][watcher.state_db_ref()]["1"]
     assert receipt["attempts"] == watcher.MAX_EVENT_DELIVERY_ATTEMPTS
     assert receipt["outcome"] == "exhausted"
+
+
+def test_project_post_is_not_repeated_after_later_side_effect_fails(monkeypatch, tmp_path):
+    watcher = load_watcher()
+    con = make_db()
+    con.execute(
+        "INSERT INTO tasks(id,title,body,assignee,status,priority,created_at,created_by) VALUES (?,?,?,?,?,?,?,?)",
+        (
+            "root_project",
+            "Delivery acceptance project",
+            "Project Hub slug: delivery-acceptance\nKanban root task id: root_project\nKanban stage: Delivery\n",
+            "antonetta",
+            "done",
+            1,
+            1,
+            "",
+        ),
+    )
+    ev = {
+        "id": 44,
+        "task_id": "root_project",
+        "run_id": 1,
+        "kind": "completed",
+        "payload": json.dumps({"summary": "Acceptance completed", "metadata": {"project_completion": True, "project_final": True, "project_final_reconciliation": True, "user_visible_change": True, "public_summary": "Acceptance completed", "why_it_matters": "No duplicate alerts"}}),
+        "created_at": 1,
+    }
+    posts = []
+    monkeypatch.setattr(watcher, "fetch_project_hub_context", lambda _slug: {"title": "Delivery acceptance", "slug": "delivery-acceptance"})
+    monkeypatch.setattr(watcher, "create_thread", lambda *_args, **_kwargs: {"id": "thread-1"})
+    monkeypatch.setattr(watcher, "post", lambda *_args, **_kwargs: posts.append("project") or {"id": "message-1"})
+    monkeypatch.setattr(watcher, "maybe_post_human_approval", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("later-step-failed")))
+    watcher.STATE_PATH = tmp_path / "state.json"
+    state = {"last_event_id": 0, "components": {}, "task_aliases": {}, "project_threads": {}}
+
+    for _ in range(2):
+        try:
+            watcher.route_event(con, state, ev, "general", "project", "red")
+        except RuntimeError:
+            pass
+
+    assert posts == ["project"]
+    receipt = state["project_thread_posts"][watcher.state_db_ref()]["44"]
+    assert receipt["message_id"] == "message-1"
