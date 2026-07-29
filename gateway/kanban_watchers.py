@@ -324,12 +324,6 @@ class GatewayKanbanWatchersMixin:
                                     delivery_scope
                                     == _kb.NOTIFY_DELIVERY_SCOPE_OWNER_PROJECT_TERMINAL
                                 )
-                                if owner_direct and _kb.parent_ids(conn, sub["task_id"]):
-                                    logger.warning(
-                                        "kanban notifier: ignoring owner terminal subscription on child task %s",
-                                        sub["task_id"],
-                                    )
-                                    continue
                                 owner_profile = sub.get("notifier_profile") or None
                                 if owner_profile and owner_profile != notifier_profile:
                                     _owner_adapters = getattr(self, "_profile_adapters", {}).get(owner_profile)
