@@ -30,3 +30,11 @@ upstream PR for this watcher deployment.
 Suppression decisions are logged as structured records to
 `~/.hermes/logs/kanban_discord_pm.log` by default. Logs include event kind,
 project slug, and a hashed event reference, but not raw worker payloads.
+
+For a deliverable project event, the watcher preserves the prior event cursor
+until Discord accepts the post. It retries a transient failure up to three
+times, recording only the bounded attempt count, error class, and hashed event
+reference in durable local state. A third failure is recorded as exhausted so
+operators can reconcile it through Project Hub without replaying an unknown
+message. This retry state is distinct from the profile-aware owner-alert
+receipt used for completion and blocker notifications.

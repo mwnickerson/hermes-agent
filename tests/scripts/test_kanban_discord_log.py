@@ -248,3 +248,42 @@ def test_deployed_private_project_model_wins_over_missing_checkout(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert "Project kickoff" in proc.stdout
     assert "suppressed-project-model-unavailable" not in proc.stdout
+
+
+def test_delivery_failure_is_retried_without_advancing_the_event_cursor(monkeypatch, tmp_path):
+    watcher = load_watcher()
+    db_path = tmp_path / "kanban.db"
+    watcher.DB_PATH = db_path
+    watcher.STATE_PATH = tmp_path / "state.json"
+    watcher.build_smoke_db(db_path)
+    state = {"last_event_id": 0, "components": {}, "task_aliases": {}, "red_thread_posts": {}}
+
+    def fail_once(*_args, **_kwargs):
+        raise TimeoutError("delivery transport unavailable")
+
+    monkeypatch.setattr(watcher, "route_event", fail_once)
+    watcher.run_once(state, "general", "project", "red", limit=1)
+
+    assert state["last_event_id"] == 0
+    receipt = state["delivery_failures"]["1"]
+    assert receipt["attempts"] == 1
+    assert receipt["error_class"] == "TimeoutError"
+    assert "delivery transport unavailable" not in json.dumps(receipt)
+
+
+def test_delivery_failure_records_exhaustion_only_after_bounded_retries(monkeypatch, tmp_path):
+    watcher = load_watcher()
+    db_path = tmp_path / "kanban.db"
+    watcher.DB_PATH = db_path
+    watcher.STATE_PATH = tmp_path / "state.json"
+    watcher.build_smoke_db(db_path)
+    state = {"last_event_id": 0, "components": {}, "task_aliases": {}, "red_thread_posts": {}}
+
+    monkeypatch.setattr(watcher, "route_event", lambda *_args, **_kwargs: (_ for _ in ()).throw(ConnectionError("unavailable")))
+    for _ in range(watcher.MAX_EVENT_DELIVERY_ATTEMPTS):
+        watcher.run_once(state, "general", "project", "red", limit=1)
+
+    assert state["last_event_id"] == 1
+    receipt = state["delivery_failures"]["1"]
+    assert receipt["attempts"] == watcher.MAX_EVENT_DELIVERY_ATTEMPTS
+    assert receipt["outcome"] == "exhausted"

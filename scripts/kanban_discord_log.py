@@ -167,6 +167,7 @@ PROJECT_HUB_BASE_URL = os.getenv("PROJECT_HUB_BASE_URL", "https://projecthub.mwn
 NOISE_KINDS = {"claimed", "spawned", "heartbeat"}
 DANGER = {"blocked", "failed", "crashed", "timed_out", "spawn_failed", "gave_up"}
 TERMINAL_STATUSES = {"done", "archived"}
+MAX_EVENT_DELIVERY_ATTEMPTS = 3
 PROJECT_WORDS = ("project", "orchestrat", "umbrella", "fan-in", "fanout", "fan-out", "milestone", "phase")
 PRINTSMITH_TERMS = ("printsmith", "3d print operator", "cad", "blender", "stl", "3mf", "slicing", "printing")
 
@@ -500,11 +501,18 @@ def load_state():
             state.setdefault("components", {})
             state.setdefault("task_aliases", {})
             state.setdefault("red_thread_posts", {})
+            state.setdefault("delivery_failures", {})
             migrate_project_thread_state(state)
             return state
         except Exception:
             pass
-    return {"last_event_id": 0, "components": {}, "task_aliases": {}, "red_thread_posts": {}}
+    return {
+        "last_event_id": 0,
+        "components": {},
+        "task_aliases": {},
+        "red_thread_posts": {},
+        "delivery_failures": {},
+    }
 
 
 def save_state(state):
@@ -964,20 +972,47 @@ def route_event(con, state, ev, channel_id, project_channel_id, red_channel_id, 
 def run_once(state, channel_id, project_channel_id, red_channel_id, dry_run=False, limit=50):
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
-    rows = con.execute(
-        "select id, task_id, run_id, kind, payload, created_at from task_events where id > ? order by id asc limit ?",
-        (int(state.get("last_event_id", 0)), limit),
-    ).fetchall()
-    for row in rows:
-        ev = dict(row)
-        try:
-            route_event(con, state, ev, channel_id, project_channel_id, red_channel_id, dry_run=dry_run)
-        except Exception as e:
-            print(f"post failed for event {ev['id']}: {e}", file=sys.stderr, flush=True)
-        state["last_event_id"] = ev["id"]
-        if not dry_run:
-            save_state(state)
-    return len(rows)
+    try:
+        rows = con.execute(
+            "select id, task_id, run_id, kind, payload, created_at from task_events where id > ? order by id asc limit ?",
+            (int(state.get("last_event_id", 0)), limit),
+        ).fetchall()
+        failures = state.setdefault("delivery_failures", {})
+        for row in rows:
+            ev = dict(row)
+            event_key = str(ev["id"])
+            try:
+                route_event(con, state, ev, channel_id, project_channel_id, red_channel_id, dry_run=dry_run)
+            except Exception as exc:
+                receipt = failures.setdefault(event_key, {"attempts": 0})
+                receipt["attempts"] = int(receipt.get("attempts", 0)) + 1
+                receipt["error_class"] = type(exc).__name__
+                receipt["updated_at"] = int(time.time())
+                log_pm_decision("retry", "delivery-failed", ev, {})
+                print(
+                    f"post retry event_ref={safe_event_ref(ev)} "
+                    f"attempt={receipt['attempts']}/{MAX_EVENT_DELIVERY_ATTEMPTS} "
+                    f"error_class={receipt['error_class']}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                if receipt["attempts"] < MAX_EVENT_DELIVERY_ATTEMPTS:
+                    if not dry_run:
+                        save_state(state)
+                    break
+                receipt["outcome"] = "exhausted"
+                log_pm_decision("suppressed", "delivery-retries-exhausted", ev, {})
+                state["last_event_id"] = ev["id"]
+                if not dry_run:
+                    save_state(state)
+                continue
+            failures.pop(event_key, None)
+            state["last_event_id"] = ev["id"]
+            if not dry_run:
+                save_state(state)
+        return len(rows)
+    finally:
+        con.close()
 
 
 def initialize_state(state, channel_id, dry_run=False):
