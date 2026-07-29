@@ -168,6 +168,20 @@ NOISE_KINDS = {"claimed", "spawned", "heartbeat"}
 DANGER = {"blocked", "failed", "crashed", "timed_out", "spawn_failed", "gave_up"}
 TERMINAL_STATUSES = {"done", "archived"}
 MAX_EVENT_DELIVERY_ATTEMPTS = 3
+# Channels that Discord accepts for ordinary message creation. Forum/media
+# channels are deliberately excluded: they accept starter posts only through
+# the thread creation endpoint below.
+MESSAGEABLE_CHANNEL_TYPES = {0, 1, 3, 5, 10, 11, 12}
+# A project narrative can start only from a text/announcement channel or a
+# forum/media parent. Reject voice/category/stage channels before issuing an
+# API call so a configuration mistake cannot create recurring delivery noise.
+THREAD_PARENT_CHANNEL_TYPES = {0, 5, 15, 16}
+
+
+class NonMessageableDiscordChannelError(RuntimeError):
+    """Raised when a configured Discord target cannot accept this operation."""
+
+
 PROJECT_WORDS = ("project", "orchestrat", "umbrella", "fan-in", "fanout", "fan-out", "milestone", "phase")
 PRINTSMITH_TERMS = ("printsmith", "3d print operator", "cad", "blender", "stl", "3mf", "slicing", "printing")
 
@@ -272,6 +286,20 @@ def discord_api(method, endpoint, body=None):
     return data
 
 
+def _channel_type(channel):
+    try:
+        return int(channel.get("type"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def require_messageable_channel(channel_id, dry_run=False):
+    channel = get_channel(channel_id, dry_run=dry_run)
+    if _channel_type(channel) not in MESSAGEABLE_CHANNEL_TYPES:
+        raise NonMessageableDiscordChannelError("Discord delivery target is not messageable")
+    return channel
+
+
 def post(channel_id, content, dry_run=False, components=None):
     body = content if isinstance(content, dict) else {"content": content}
     if components is not None:
@@ -284,6 +312,7 @@ def post(channel_id, content, dry_run=False, components=None):
     if dry_run:
         print(f"DRY-RUN post channel={channel_id}:\n{body.get('content', '')}\ncomponents={json.dumps(body.get('components', []), ensure_ascii=False)}\n---")
         return {"id": f"dry-msg-{int(time.time() * 1000)}", "channel_id": channel_id}
+    require_messageable_channel(channel_id)
     return discord_api("POST", f"/channels/{channel_id}/messages", body)
 
 
@@ -300,7 +329,9 @@ def get_channel(channel_id, dry_run=False):
 
 def create_thread(parent_channel_id, name, message, dry_run=False, applied_tags=None):
     parent = get_channel(parent_channel_id, dry_run=dry_run)
-    parent_type = int(parent.get("type", 0) or 0)
+    parent_type = _channel_type(parent)
+    if parent_type not in THREAD_PARENT_CHANNEL_TYPES:
+        raise NonMessageableDiscordChannelError("Discord project parent is not a supported thread channel")
     rendered = render_discord_human_text(message, metadata={})
     message = rendered.text
     body = {"name": name[:90], "auto_archive_duration": 10080, "message": {"content": message}}
@@ -1016,6 +1047,23 @@ def run_once(state, channel_id, project_channel_id, red_channel_id, dry_run=Fals
             event_key = str(ev["id"])
             try:
                 route_event(con, state, ev, channel_id, project_channel_id, red_channel_id, dry_run=dry_run)
+            except NonMessageableDiscordChannelError as exc:
+                receipt = failures.setdefault(event_key, {"attempts": 0})
+                receipt["attempts"] = int(receipt.get("attempts", 0)) + 1
+                receipt["error_class"] = type(exc).__name__
+                receipt["outcome"] = "suppressed-invalid-discord-channel-type"
+                receipt["updated_at"] = int(time.time())
+                log_pm_decision("suppressed", "invalid-discord-channel-type", ev, {})
+                print(
+                    f"post suppressed event_ref={safe_event_ref(ev)} "
+                    "reason=invalid-discord-channel-type",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                state["last_event_id"] = ev["id"]
+                if not dry_run:
+                    save_state(state)
+                continue
             except Exception as exc:
                 receipt = failures.setdefault(event_key, {"attempts": 0})
                 receipt["attempts"] = int(receipt.get("attempts", 0)) + 1

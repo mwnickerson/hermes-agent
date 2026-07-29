@@ -250,6 +250,42 @@ def test_deployed_private_project_model_wins_over_missing_checkout(tmp_path):
     assert "suppressed-project-model-unavailable" not in proc.stdout
 
 
+def test_non_messageable_target_is_rejected_before_discord_post(monkeypatch):
+    watcher = load_watcher()
+    calls = []
+    monkeypatch.setattr(watcher, "get_channel", lambda *_args, **_kwargs: {"type": 2})
+    monkeypatch.setattr(watcher, "discord_api", lambda *args, **kwargs: calls.append((args, kwargs)))
+
+    try:
+        watcher.post("voice-target", "must not deliver")
+    except watcher.NonMessageableDiscordChannelError:
+        pass
+    else:
+        raise AssertionError("non-messageable Discord channel was accepted")
+
+    assert calls == []
+
+
+def test_non_messageable_target_is_suppressed_without_retry(monkeypatch, tmp_path):
+    watcher = load_watcher()
+    db_path = tmp_path / "kanban.db"
+    watcher.DB_PATH = db_path
+    watcher.STATE_PATH = tmp_path / "state.json"
+    watcher.build_smoke_db(db_path)
+    state = {"last_event_id": 0, "components": {}, "task_aliases": {}, "red_thread_posts": {}}
+
+    def reject_target(*_args, **_kwargs):
+        raise watcher.NonMessageableDiscordChannelError("not messageable")
+
+    monkeypatch.setattr(watcher, "route_event", reject_target)
+    watcher.run_once(state, "general", "project", "red", limit=1)
+
+    assert state["last_event_id"] == 1
+    receipt = state["delivery_failures"][watcher.state_db_ref()]["1"]
+    assert receipt["attempts"] == 1
+    assert receipt["outcome"] == "suppressed-invalid-discord-channel-type"
+
+
 def test_delivery_failure_is_retried_without_advancing_the_event_cursor(monkeypatch, tmp_path):
     watcher = load_watcher()
     db_path = tmp_path / "kanban.db"
