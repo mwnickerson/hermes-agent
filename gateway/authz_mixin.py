@@ -47,6 +47,21 @@ class GatewayAuthorizationMixin:
         if not platform:
             return None
         profile_name = (profile or "").strip() or None
+        active_profile = None
+        active_profile_name = getattr(self, "_active_profile_name", None)
+        if callable(active_profile_name):
+            try:
+                active_profile = (active_profile_name() or "").strip() or None
+            except Exception:
+                active_profile = None
+        # The active profile owns ``self.adapters``. It may have a non-default
+        # name (for example Antonetta), so treating every non-default stamped
+        # profile as a multiplexed secondary would incorrectly make its own
+        # connected adapter unavailable. This is not a cross-profile fallback:
+        # only the exact active profile is allowed through this branch.
+        if profile_name and profile_name == active_profile:
+            adapters = getattr(self, "adapters", None) or {}
+            return adapters.get(platform)
         if profile_name and profile_name != "default":
             profile_adapters = getattr(self, "_profile_adapters", None) or {}
             if profile_name in profile_adapters:
