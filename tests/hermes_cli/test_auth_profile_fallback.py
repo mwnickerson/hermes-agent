@@ -543,6 +543,15 @@ def test_keychain_profile_store_missing_item_fails_closed(profile_env, tmp_path,
         _load_auth_store()
 
 
+def test_keychain_profile_store_requires_posix_uid(monkeypatch):
+    from hermes_cli import auth
+
+    monkeypatch.delattr(auth.os, "geteuid", raising=False)
+
+    with pytest.raises(RuntimeError, match="requires POSIX ownership checks"):
+        auth._keychain_auth_store_effective_uid()
+
+
 def test_keychain_marker_enables_profile_isolation_without_launcher_env(profile_env, tmp_path, monkeypatch):
     _backing, receipt = _configure_fake_keychain_auth_store(tmp_path, monkeypatch)
     state_dir = profile_env["profile"] / "state"

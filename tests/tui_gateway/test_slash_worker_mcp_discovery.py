@@ -10,11 +10,28 @@ import subprocess
 import sys
 import textwrap
 import threading
+from types import SimpleNamespace
 
 import pytest
 import yaml
 
 pytest.importorskip("mcp.server.fastmcp")
+
+
+def test_spurious_stdin_eof_restores_blocking_mode(monkeypatch):
+    from tui_gateway import slash_worker
+
+    restored: list[tuple[int, bool]] = []
+    monkeypatch.setattr(slash_worker.sys, "stdin", SimpleNamespace(fileno=lambda: 37))
+    monkeypatch.setattr(slash_worker.os, "get_blocking", lambda fd: False)
+    monkeypatch.setattr(
+        slash_worker.os,
+        "set_blocking",
+        lambda fd, blocking: restored.append((fd, blocking)),
+    )
+
+    assert slash_worker._recover_spurious_stdin_eof([]) is True
+    assert restored == [(37, True)]
 
 
 def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
@@ -97,7 +114,8 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
         assert response["ok"] is True
         assert "mcp__profileprobe__hermes_61922_profile_probe" in response["output"]
     finally:
-        proc.terminate()
+        if proc.stdin is not None and not proc.stdin.closed:
+            proc.stdin.close()
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:

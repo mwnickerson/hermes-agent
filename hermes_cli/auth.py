@@ -907,6 +907,19 @@ class _KeychainAuthStoreConfig:
     receipt_path: Path
 
 
+def _keychain_auth_store_effective_uid() -> int:
+    """Return the POSIX effective UID required for Keychain ownership checks.
+
+    The native Keychain bridge is macOS-specific.  Resolve ``geteuid`` at
+    runtime so simply importing this module remains safe on Windows, then fail
+    closed if someone attempts to enable the bridge on a non-POSIX runtime.
+    """
+    geteuid = getattr(os, "geteuid", None)
+    if not callable(geteuid):
+        raise RuntimeError("Keychain auth store requires POSIX ownership checks")
+    return int(geteuid())
+
+
 def _keychain_auth_store_enabled() -> bool:
     """Whether this Hermes process must use the native Keychain backend.
 
@@ -937,7 +950,11 @@ def _load_keychain_auth_store_marker() -> Optional[Dict[str, str]]:
         raw = json.loads(marker.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError) as exc:
         raise RuntimeError("Keychain auth store marker is unreadable or invalid") from exc
-    if not stat.S_ISREG(marker_stat.st_mode) or marker_stat.st_uid != os.geteuid() or marker_stat.st_mode & 0o077:
+    if (
+        not stat.S_ISREG(marker_stat.st_mode)
+        or marker_stat.st_uid != _keychain_auth_store_effective_uid()
+        or marker_stat.st_mode & 0o077
+    ):
         raise RuntimeError("Keychain auth store marker ownership or mode is unsafe")
     if not isinstance(raw, dict) or raw.get("backend") != _KEYCHAIN_AUTH_STORE_MODE:
         raise RuntimeError("Keychain auth store marker has an invalid backend")
@@ -989,7 +1006,11 @@ def _keychain_auth_store_config() -> Optional[_KeychainAuthStoreConfig]:
         raise RuntimeError("Keychain auth store bridge is unavailable") from exc
     if not stat.S_ISREG(bridge_stat.st_mode):
         raise RuntimeError("Keychain auth store bridge is not a regular file")
-    if bridge_stat.st_uid != os.geteuid() or bridge_stat.st_mode & 0o077 or not bridge_stat.st_mode & stat.S_IXUSR:
+    if (
+        bridge_stat.st_uid != _keychain_auth_store_effective_uid()
+        or bridge_stat.st_mode & 0o077
+        or not bridge_stat.st_mode & stat.S_IXUSR
+    ):
         raise RuntimeError("Keychain auth store bridge ownership or mode is unsafe")
 
     receipt_path = Path(receipt_raw)
@@ -1087,7 +1108,7 @@ def _append_keychain_auth_store_receipt(
         parent_stat = parent.stat()
     except OSError as exc:
         raise RuntimeError("Keychain auth-store receipt directory is unavailable") from exc
-    if parent_stat.st_uid != os.geteuid() or parent_stat.st_mode & 0o077:
+    if parent_stat.st_uid != _keychain_auth_store_effective_uid() or parent_stat.st_mode & 0o077:
         raise RuntimeError("Keychain auth-store receipt directory ownership or mode is unsafe")
 
     if receipt_path.exists():
@@ -1095,7 +1116,11 @@ def _append_keychain_auth_store_receipt(
             receipt_stat = receipt_path.stat()
         except OSError as exc:
             raise RuntimeError("Keychain auth-store receipt is unavailable") from exc
-        if not stat.S_ISREG(receipt_stat.st_mode) or receipt_stat.st_uid != os.geteuid() or receipt_stat.st_mode & 0o077:
+        if (
+            not stat.S_ISREG(receipt_stat.st_mode)
+            or receipt_stat.st_uid != _keychain_auth_store_effective_uid()
+            or receipt_stat.st_mode & 0o077
+        ):
             raise RuntimeError("Keychain auth-store receipt ownership or mode is unsafe")
 
     providers = auth_store.get("providers")
@@ -1103,7 +1128,7 @@ def _append_keychain_auth_store_receipt(
     receipt = {
         "at": datetime.now(timezone.utc).isoformat(),
         "what": "hermes_auth_state_persisted",
-        "who_uid": os.geteuid(),
+        "who_uid": _keychain_auth_store_effective_uid(),
         "why": "runtime authentication state update",
         "where": _keychain_auth_store_descriptor(),
         "how": "native_keychain_auth_store",

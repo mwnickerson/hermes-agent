@@ -255,7 +255,7 @@ def fetch_project_hub_context(slug, timeout=5):
 def load_env(path: Path):
     if not path.exists():
         return
-    for line in path.read_text(errors="ignore").splitlines():
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue

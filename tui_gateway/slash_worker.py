@@ -49,6 +49,7 @@ def _env_float(name: str, default: float) -> float:
 _WATCHDOG_POLL_S = max(0.05, _env_float("HERMES_SLASH_WATCHDOG_POLL_S", 2.0))
 _ORPHAN_GRACE_S = max(0.0, _env_float("HERMES_SLASH_WATCHDOG_GRACE_S", 5.0))
 _in_flight = threading.Event()  # set while a command is executing
+_MAX_SPURIOUS_STDIN_RECOVERIES_PER_MINUTE = 10
 
 
 def _is_orphaned(original_ppid, parent_create_time, getppid=os.getppid) -> bool:
@@ -84,6 +85,42 @@ def _prepare_slash_worker_runtime() -> None:
         thread_name="slash-worker-mcp-discovery",
     )
     wait_for_mcp_discovery()
+
+
+def _recover_spurious_stdin_eof(recovery_times: list[float]) -> bool:
+    """Restore blocking stdin after a child changes the shared pipe state.
+
+    MCP discovery starts a stdio child before this worker serves its first
+    command.  On POSIX, a child can toggle ``O_NONBLOCK`` on the shared open
+    file description.  Python then presents the parent's transient ``EAGAIN``
+    as an empty ``readline`` result, which is otherwise indistinguishable from
+    a genuine peer close.  Recover only when the descriptor is non-blocking,
+    and cap recoveries to avoid a busy loop if another child keeps changing it.
+    """
+    try:
+        stdin_fd = sys.stdin.fileno()
+        if os.get_blocking(stdin_fd):
+            return False
+        os.set_blocking(stdin_fd, True)
+    except (AttributeError, OSError):
+        return False
+
+    now = time.monotonic()
+    recovery_times.append(now)
+    recovery_times[:] = [seen_at for seen_at in recovery_times if seen_at > now - 60]
+    if len(recovery_times) > _MAX_SPURIOUS_STDIN_RECOVERIES_PER_MINUTE:
+        print(
+            "[slash-worker] stdin spurious-EOF recovery rate exceeded",
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
+    print(
+        "[slash-worker] stdin spurious EOF; restored blocking stdin",
+        file=sys.stderr,
+        flush=True,
+    )
+    return True
 
 
 def _start_parent_death_watchdog(original_ppid, parent_create_time) -> None:
@@ -155,7 +192,13 @@ def main():
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         cli = HermesCLI(model=args.model or None, compact=True, resume=args.session_key, verbose=False)
 
-    for raw in sys.stdin:
+    stdin_recovery_times: list[float] = []
+    while True:
+        raw = sys.stdin.readline()
+        if not raw:
+            if _recover_spurious_stdin_eof(stdin_recovery_times):
+                continue
+            break
         line = raw.strip()
         if not line:
             continue
