@@ -30,6 +30,7 @@ ROUTINE_PRESENTATION_KINDS = ROUTINE_EVENT_KINDS | {"janitor", "promote", "archi
 FINAL_RECONCILIATION_KEYS = {"project_completion", "project_final", "project_final_reconciliation"}
 REVIEW_WORDS = ("review", "review-required", "changes-requested", "changes requested", "approval", "approve")
 BLOCKER_WORDS = ("blocked", "blocker", "needs input", "cannot proceed")
+MILESTONE_WORDS = ("milestone", "stage completed", "stage complete", "meaningful handoff")
 MACHINE_SHAPED_RE = re.compile(
     r"(\bTraceback\b|\bstdout\b|\bstderr\b|/Users/|/tmp/|/private/|[A-Za-z]:\\|```|"
     r"\b(?:python|pytest|git|curl|npm|node|uv|hermes)\s+|"
@@ -287,6 +288,13 @@ def map_project_status(tasks: Iterable[dict[str, Any]]) -> str:
     return "active"
 
 
+def _is_milestone_comment(payload: dict[str, Any] | None) -> bool:
+    """Return whether an explicit project milestone comment merits Discord narration."""
+    payload = payload or {}
+    text = str(payload.get("body") or payload.get("comment") or "").lower()
+    return any(word in text for word in MILESTONE_WORDS)
+
+
 def should_post_project_thread_event(kind: str, payload: dict[str, Any] | None = None) -> bool:
     payload = payload or {}
     if kind in PROJECT_EVENT_KINDS:
@@ -310,7 +318,7 @@ def should_post_project_thread_event(kind: str, payload: dict[str, Any] | None =
         )
     if kind == "commented":
         text = str(payload.get("body") or payload.get("comment") or "").lower()
-        return any(word in text for word in ("block", "approval", "review", "done", "complete", "milestone"))
+        return _is_milestone_comment(payload) or any(word in text for word in ("block", "approval", "review"))
     return False
 
 
@@ -400,6 +408,7 @@ def _needs_attention(kind: str, payload: dict[str, Any], meta: dict[str, Any]) -
     return (
         kind in DANGER_EVENT_KINDS
         or bool(meta.get("review_required") or meta.get("changes_requested") or meta.get("human_approval_required"))
+        or _is_milestone_comment(payload)
         or any(word in text for word in REVIEW_WORDS + BLOCKER_WORDS)
     )
 
@@ -467,7 +476,10 @@ def render_project_pm_update(
     role = _safe_human_text(meta.get("task_role") or meta.get("stage_role") or payload.get("role"), max_len=120)
     # Raw worker summaries/results are internal handoffs. Only fields explicitly
     # marked as public presentation copy may cross the Discord boundary.
+    comment_text = _safe_human_text(payload.get("body") or payload.get("comment"), max_len=300)
     summary = _safe_human_text(meta.get("public_summary") or meta.get("dsr_summary"), max_len=300)
+    if not summary and kind == "commented" and _is_milestone_comment(payload):
+        summary = comment_text
     reason_text = _safe_human_text(
         meta.get("why_it_matters") or meta.get("why") or payload.get("reason") or meta.get("rationale"),
         max_len=300,
@@ -499,7 +511,7 @@ def render_project_pm_update(
         "project_stage_completed": "Stage completed",
         "project_final_summary": "Project reconciled",
         "completed": "Work completed" if not is_final else "Project reconciled",
-        "commented": "Decision needed" if action != "No action needed." else "Project update",
+        "commented": "Milestone" if _is_milestone_comment(payload) else ("Decision needed" if action != "No action needed." else "Project update"),
         "blocked": "Blocked",
     }.get(kind, kind.replace("_", " ").title())
 

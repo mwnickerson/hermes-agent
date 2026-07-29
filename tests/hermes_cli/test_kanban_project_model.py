@@ -297,6 +297,24 @@ def test_pm_render_changes_requested_not_completion():
     assert "Changes requested; this is not project completion." in rendered.message
 
 
+def test_pm_render_explicit_milestone_comment_is_human_readable():
+    task, project, hub = _pm_base()
+    rendered = kpm.render_project_pm_update(
+        task,
+        "commented",
+        {
+            "body": "**Milestone — lifecycle wiring verified**\nThe project thread now has the required human-readable update.",
+            "metadata": {"task_role": "Acceptance verification"},
+        },
+        project,
+        hub,
+    )
+    assert rendered.should_post is True
+    _assert_pm_contract(rendered.message)
+    assert "**Milestone:" in rendered.message
+    assert "lifecycle wiring verified" in rendered.message
+
+
 def test_pm_render_blocker_and_approval_request():
     task, project, hub = _pm_base()
     blocked = kpm.render_project_pm_update(
