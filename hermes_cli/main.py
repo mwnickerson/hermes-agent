@@ -866,20 +866,19 @@ def _has_any_provider_configured() -> bool:
     except Exception:
         pass
 
-    # Check for Nous Portal OAuth credentials
-    auth_file = get_hermes_home() / "auth.json"
-    if auth_file.exists():
-        try:
-            import json
+    # Ask the auth persistence boundary for the active OAuth provider instead
+    # of reading auth.json directly.  This also supports a profile that keeps
+    # its auth document in the device Keychain.
+    try:
+        from hermes_cli.auth import get_active_provider
 
-            auth = json.loads(auth_file.read_text())
-            active = auth.get("active_provider")
-            if active:
-                status = get_auth_status(active)
-                if status.get("logged_in"):
-                    return True
-        except Exception:
-            pass
+        active = get_active_provider()
+        if active:
+            status = get_auth_status(active)
+            if status.get("logged_in"):
+                return True
+    except Exception:
+        pass
 
     # Check config.yaml — if model is a dict with an explicit provider set,
     # the user has gone through setup (fresh installs have model as a plain

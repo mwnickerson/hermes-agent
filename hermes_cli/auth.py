@@ -891,6 +891,239 @@ def _oauth_trace(event: str, *, sequence_id: Optional[str] = None, **fields: Any
 # Auth Store — persistence layer for ~/.hermes/auth.json
 # =============================================================================
 
+
+_KEYCHAIN_AUTH_STORE_MODE = "keychain"
+_KEYCHAIN_AUTH_STORE_MAX_BYTES = 64 * 1024
+_KEYCHAIN_AUTH_STORE_MARKER_NAME = "auth-store-keychain.json"
+
+
+@dataclass(frozen=True)
+class _KeychainAuthStoreConfig:
+    """Validated, non-secret settings for a native Keychain auth store."""
+
+    bridge: Path
+    account: str
+    service: str
+    receipt_path: Path
+
+
+def _keychain_auth_store_enabled() -> bool:
+    """Whether this Hermes process must use the native Keychain backend.
+
+    The setting is deliberately opt-in and process-scoped.  A profile launch
+    agent can turn it on without changing classic/root Hermes behavior.
+    """
+    if os.environ.get("HERMES_AUTH_STORE_MODE", "").strip().lower() == _KEYCHAIN_AUTH_STORE_MODE:
+        return True
+    marker = _keychain_auth_store_marker_path()
+    # A present but malformed marker must still select the backend so config
+    # validation fails closed rather than falling back to root auth state.
+    return marker.exists() or marker.is_symlink()
+
+
+def _keychain_auth_store_marker_path() -> Path:
+    return get_hermes_home() / "state" / _KEYCHAIN_AUTH_STORE_MARKER_NAME
+
+
+def _load_keychain_auth_store_marker() -> Optional[Dict[str, str]]:
+    """Read the profile-local, non-secret Keychain backend declaration."""
+    marker = _keychain_auth_store_marker_path()
+    if not marker.exists() and not marker.is_symlink():
+        return None
+    if marker.is_symlink():
+        raise RuntimeError("Keychain auth store marker must not be a symlink")
+    try:
+        marker_stat = marker.stat()
+        raw = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise RuntimeError("Keychain auth store marker is unreadable or invalid") from exc
+    if not stat.S_ISREG(marker_stat.st_mode) or marker_stat.st_uid != os.geteuid() or marker_stat.st_mode & 0o077:
+        raise RuntimeError("Keychain auth store marker ownership or mode is unsafe")
+    if not isinstance(raw, dict) or raw.get("backend") != _KEYCHAIN_AUTH_STORE_MODE:
+        raise RuntimeError("Keychain auth store marker has an invalid backend")
+    required = ("bridge", "account", "service", "receipt_path")
+    if not all(isinstance(raw.get(field), str) and raw[field].strip() for field in required):
+        raise RuntimeError("Keychain auth store marker is incomplete")
+    return {field: str(raw[field]).strip() for field in required}
+
+
+def _safe_keychain_component(value: str, *, name: str) -> str:
+    """Validate a Keychain account/service component before subprocess use."""
+    normalized = value.strip()
+    if not normalized or len(normalized) > 200:
+        raise RuntimeError(f"Keychain auth store {name} is missing or invalid")
+    if not all(char.isalnum() or char in "._-:" for char in normalized):
+        raise RuntimeError(f"Keychain auth store {name} contains unsafe characters")
+    return normalized
+
+
+def _keychain_auth_store_config() -> Optional[_KeychainAuthStoreConfig]:
+    """Return the strict Keychain config, or ``None`` outside Keychain mode.
+
+    Fail closed on an unsafe bridge or receipt path.  The auth-state document
+    is never accepted through an environment variable or command argument.
+    """
+    if not _keychain_auth_store_enabled():
+        return None
+
+    marker = _load_keychain_auth_store_marker()
+    if marker is not None:
+        bridge_raw = marker["bridge"]
+        account_raw = marker["account"]
+        service_raw = marker["service"]
+        receipt_raw = marker["receipt_path"]
+    else:
+        bridge_raw = os.environ.get("HERMES_AUTH_KEYCHAIN_BRIDGE", "").strip()
+        account_raw = os.environ.get("HERMES_AUTH_KEYCHAIN_ACCOUNT", "").strip()
+        service_raw = os.environ.get("HERMES_AUTH_KEYCHAIN_SERVICE", "").strip()
+        receipt_raw = os.environ.get("HERMES_AUTH_KEYCHAIN_RECEIPT_PATH", "").strip()
+    if not bridge_raw or not receipt_raw:
+        raise RuntimeError("Keychain auth store bridge or receipt path is missing")
+
+    bridge = Path(bridge_raw)
+    if not bridge.is_absolute() or bridge.is_symlink():
+        raise RuntimeError("Keychain auth store bridge must be an absolute non-symlink path")
+    try:
+        bridge_stat = bridge.stat()
+    except OSError as exc:
+        raise RuntimeError("Keychain auth store bridge is unavailable") from exc
+    if not stat.S_ISREG(bridge_stat.st_mode):
+        raise RuntimeError("Keychain auth store bridge is not a regular file")
+    if bridge_stat.st_uid != os.geteuid() or bridge_stat.st_mode & 0o077 or not bridge_stat.st_mode & stat.S_IXUSR:
+        raise RuntimeError("Keychain auth store bridge ownership or mode is unsafe")
+
+    receipt_path = Path(receipt_raw)
+    if not receipt_path.is_absolute() or receipt_path.name in {"", ".", ".."}:
+        raise RuntimeError("Keychain auth store receipt path is invalid")
+    if receipt_path.exists() and receipt_path.is_symlink():
+        raise RuntimeError("Keychain auth store receipt path must not be a symlink")
+
+    return _KeychainAuthStoreConfig(
+        bridge=bridge,
+        account=_safe_keychain_component(account_raw, name="account"),
+        service=_safe_keychain_component(service_raw, name="service"),
+        receipt_path=receipt_path,
+    )
+
+
+def _keychain_auth_store_descriptor() -> str:
+    """Return a redacted stable source label for status and diagnostics."""
+    config = _keychain_auth_store_config()
+    if config is None:
+        return str(_auth_file_path())
+    return f"keychain://{config.service}"
+
+
+def _keychain_auth_store_run(
+    config: _KeychainAuthStoreConfig,
+    operation: str,
+    *,
+    payload: Optional[bytes] = None,
+) -> bytes:
+    """Call the narrow native bridge without exposing auth bytes in argv/logs."""
+    if operation not in {"read", "write"}:
+        raise RuntimeError("Invalid Keychain auth store operation")
+    result = subprocess.run(
+        [str(config.bridge), operation, config.account, config.service],
+        input=payload,
+        stdin=subprocess.DEVNULL if payload is None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("Keychain auth store is unavailable; refusing plaintext or global fallback")
+    if len(result.stdout) > _KEYCHAIN_AUTH_STORE_MAX_BYTES:
+        raise RuntimeError("Keychain auth store returned an oversized document")
+    return bytes(result.stdout)
+
+
+def _decode_keychain_auth_store(payload: bytes) -> Dict[str, Any]:
+    """Parse the Keychain document strictly; malformed state is fail-closed."""
+    if not payload or len(payload) > _KEYCHAIN_AUTH_STORE_MAX_BYTES:
+        raise RuntimeError("Keychain auth store is empty or oversized")
+    try:
+        raw = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, TypeError) as exc:
+        raise RuntimeError("Keychain auth store contains invalid JSON") from exc
+    if isinstance(raw, dict) and (
+        isinstance(raw.get("providers"), dict)
+        or isinstance(raw.get("credential_pool"), dict)
+    ):
+        raw.setdefault("providers", {})
+        if isinstance(raw.get("providers"), dict):
+            _migrate_stale_nous_portal_url(raw["providers"])
+        return raw
+    if isinstance(raw, dict) and isinstance(raw.get("systems"), dict):
+        systems = raw["systems"]
+        providers = {}
+        if "nous_portal" in systems:
+            providers["nous"] = systems["nous_portal"]
+        return {
+            "version": AUTH_STORE_VERSION,
+            "providers": providers,
+            "active_provider": "nous" if providers else None,
+        }
+    raise RuntimeError("Keychain auth store schema is invalid")
+
+
+def _load_keychain_auth_store() -> Dict[str, Any]:
+    config = _keychain_auth_store_config()
+    if config is None:  # Defensive: callers gate this function first.
+        raise RuntimeError("Keychain auth store is not enabled")
+    return _decode_keychain_auth_store(_keychain_auth_store_run(config, "read"))
+
+
+def _append_keychain_auth_store_receipt(
+    config: _KeychainAuthStoreConfig,
+    auth_store: Dict[str, Any],
+) -> None:
+    """Append a redacted, durable receipt after a successful Keychain write."""
+    receipt_path = config.receipt_path
+    parent = receipt_path.parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        parent.chmod(stat.S_IRWXU)
+        parent_stat = parent.stat()
+    except OSError as exc:
+        raise RuntimeError("Keychain auth-store receipt directory is unavailable") from exc
+    if parent_stat.st_uid != os.geteuid() or parent_stat.st_mode & 0o077:
+        raise RuntimeError("Keychain auth-store receipt directory ownership or mode is unsafe")
+
+    if receipt_path.exists():
+        try:
+            receipt_stat = receipt_path.stat()
+        except OSError as exc:
+            raise RuntimeError("Keychain auth-store receipt is unavailable") from exc
+        if not stat.S_ISREG(receipt_stat.st_mode) or receipt_stat.st_uid != os.geteuid() or receipt_stat.st_mode & 0o077:
+            raise RuntimeError("Keychain auth-store receipt ownership or mode is unsafe")
+
+    providers = auth_store.get("providers")
+    provider_ids = sorted(str(provider_id) for provider_id in providers) if isinstance(providers, dict) else []
+    receipt = {
+        "at": datetime.now(timezone.utc).isoformat(),
+        "what": "hermes_auth_state_persisted",
+        "who_uid": os.geteuid(),
+        "why": "runtime authentication state update",
+        "where": _keychain_auth_store_descriptor(),
+        "how": "native_keychain_auth_store",
+        "provider_ids": provider_ids,
+    }
+    encoded = (json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(str(receipt_path), flags, stat.S_IRUSR | stat.S_IWUSR)
+        try:
+            os.write(descriptor, encoded)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        receipt_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    except OSError as exc:
+        raise RuntimeError("Keychain auth-store receipt could not be written") from exc
+
+
 def _auth_file_path() -> Path:
     path = get_hermes_home() / "auth.json"
     # Seat belt: if pytest is running and HERMES_HOME resolves to the real
@@ -923,6 +1156,13 @@ def _global_auth_file_path() -> Optional[Path]:
 
     See issue #18594 follow-up (credential_pool shadowing).
     """
+    # A Keychain-backed profile is intentionally isolated.  Returning a
+    # global path here would let a missing/corrupt Keychain item silently
+    # inherit a different Hermes identity.
+    if _keychain_auth_store_enabled():
+        _keychain_auth_store_config()  # validate the opt-in boundary eagerly
+        return None
+
     try:
         from hermes_constants import get_default_hermes_root
         global_root = get_default_hermes_root()
@@ -1079,6 +1319,8 @@ def _auth_store_lock(timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS):
 
 
 def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
+    if auth_file is None and _keychain_auth_store_enabled():
+        return _load_keychain_auth_store()
     auth_file = auth_file or _auth_file_path()
     if not auth_file.exists():
         return {"version": AUTH_STORE_VERSION, "providers": {}}
@@ -1126,6 +1368,19 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
     # specific store — e.g. the global-root write-through for rotating xAI
     # OAuth grants (#43589) — reusing this function's atomic O_EXCL + 0o600
     # write so the root auth.json gets the same TOCTOU-safe treatment.
+    if target_path is None and _keychain_auth_store_enabled():
+        config = _keychain_auth_store_config()
+        if config is None:  # pragma: no cover - guarded by mode check above
+            raise RuntimeError("Keychain auth store is not enabled")
+        auth_store["version"] = AUTH_STORE_VERSION
+        auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
+        payload = (json.dumps(auth_store, indent=2) + "\n").encode("utf-8")
+        if len(payload) > _KEYCHAIN_AUTH_STORE_MAX_BYTES:
+            raise RuntimeError("Keychain auth store document exceeds the configured size limit")
+        _keychain_auth_store_run(config, "write", payload=payload)
+        _append_keychain_auth_store_receipt(config, auth_store)
+        return _auth_file_path()
+
     auth_file = target_path if target_path is not None else _auth_file_path()
     auth_file.parent.mkdir(parents=True, exist_ok=True)
     # Tighten parent dir to 0o700 so siblings can't traverse to creds.
@@ -4922,17 +5177,22 @@ def _quarantine_nous_oauth_state(
         "refresh_token_fp": _token_fingerprint(state.get("refresh_token")),
     }
 
-    # On-disk integrity of the auth store at the moment of quarantine.
+    # Storage-boundary metadata at the moment of quarantine.  A Keychain
+    # profile must not report an absent plaintext auth.json as its source.
     try:
-        auth_path = _auth_file_path()
-        forensic["auth_json_path"] = str(auth_path)
-        try:
-            st = os.stat(auth_path)
-            forensic["auth_json_size"] = st.st_size
-            forensic["auth_json_mtime"] = st.st_mtime
-            forensic["auth_json_exists"] = True
-        except FileNotFoundError:
-            forensic["auth_json_exists"] = False
+        if _keychain_auth_store_enabled():
+            forensic["auth_store"] = _keychain_auth_store_descriptor()
+            forensic["auth_store_backend"] = "keychain"
+        else:
+            auth_path = _auth_file_path()
+            forensic["auth_json_path"] = str(auth_path)
+            try:
+                st = os.stat(auth_path)
+                forensic["auth_json_size"] = st.st_size
+                forensic["auth_json_mtime"] = st.st_mtime
+                forensic["auth_json_exists"] = True
+            except FileNotFoundError:
+                forensic["auth_json_exists"] = False
     except Exception as exc:  # pragma: no cover - never let logging break quarantine
         forensic["auth_json_stat_error"] = repr(exc)
 
@@ -5946,6 +6206,19 @@ _nous_auth_status_cache: Optional[Tuple[float, str, Optional[float], Dict[str, A
 
 
 def _auth_file_cache_key() -> Tuple[str, Optional[float]]:
+    if _keychain_auth_store_enabled():
+        try:
+            descriptor = _keychain_auth_store_descriptor()
+            updated_at = _load_keychain_auth_store().get("updated_at")
+            if isinstance(updated_at, str) and updated_at:
+                normalized = updated_at.replace("Z", "+00:00")
+                return descriptor, datetime.fromisoformat(normalized).timestamp()
+            return descriptor, None
+        except Exception:
+            # The subsequent status check performs the authoritative read and
+            # reports the fail-closed backend error.  Do not substitute a file
+            # timestamp or global-root fallback here.
+            return "keychain://unavailable", None
     auth_file = _auth_file_path()
     try:
         auth_file_key = str(auth_file.resolve(strict=False))
@@ -5957,6 +6230,12 @@ def _auth_file_cache_key() -> Tuple[str, Optional[float]]:
         return auth_file_key, None
     except Exception:
         return auth_file_key, None
+
+
+def get_auth_store_cache_fingerprint() -> str:
+    """Return a redacted auth-store revision for non-secret cache invalidation."""
+    source, revision = _auth_file_cache_key()
+    return f"{source}@{revision if revision is not None else 'unknown'}"
 
 
 def invalidate_nous_auth_status_cache() -> None:
@@ -6146,7 +6425,7 @@ def get_codex_auth_status() -> Dict[str, Any]:
                 if api_key and not _codex_access_token_is_expiring(api_key, 0):
                     return {
                         "logged_in": True,
-                        "auth_store": str(_auth_file_path()),
+                        "auth_store": _keychain_auth_store_descriptor(),
                         "last_refresh": getattr(entry, "last_refresh", None),
                         "auth_mode": "chatgpt",
                         "source": f"pool:{getattr(entry, 'label', 'unknown')}",
@@ -6156,7 +6435,7 @@ def get_codex_auth_status() -> Dict[str, Any]:
             if rate_limit:
                 return {
                     "logged_in": True,
-                    "auth_store": str(_auth_file_path()),
+                    "auth_store": _keychain_auth_store_descriptor(),
                     "last_refresh": rate_limit.get("last_refresh"),
                     "auth_mode": "chatgpt",
                     "source": f"pool:{rate_limit.get('label') or 'unknown'}",
@@ -6176,7 +6455,7 @@ def get_codex_auth_status() -> Dict[str, Any]:
         creds = resolve_codex_runtime_credentials()
         return {
             "logged_in": True,
-            "auth_store": str(_auth_file_path()),
+            "auth_store": _keychain_auth_store_descriptor(),
             "last_refresh": creds.get("last_refresh"),
             "auth_mode": creds.get("auth_mode"),
             "source": creds.get("source"),
@@ -6185,7 +6464,7 @@ def get_codex_auth_status() -> Dict[str, Any]:
     except AuthError as exc:
         return {
             "logged_in": False,
-            "auth_store": str(_auth_file_path()),
+            "auth_store": _keychain_auth_store_descriptor(),
             "error": str(exc),
         }
 
@@ -6205,7 +6484,7 @@ def get_xai_oauth_auth_status() -> Dict[str, Any]:
                 if api_key and not _xai_access_token_is_expiring(api_key, 0):
                     return {
                         "logged_in": True,
-                        "auth_store": str(_auth_file_path()),
+                        "auth_store": _keychain_auth_store_descriptor(),
                         "last_refresh": getattr(entry, "last_refresh", None),
                         # Display/telemetry only. Device-code is the only xAI
                         # OAuth flow, so report it unconditionally (auth.json
@@ -6221,7 +6500,7 @@ def get_xai_oauth_auth_status() -> Dict[str, Any]:
         creds = resolve_xai_oauth_runtime_credentials()
         return {
             "logged_in": True,
-            "auth_store": str(_auth_file_path()),
+            "auth_store": _keychain_auth_store_descriptor(),
             "last_refresh": creds.get("last_refresh"),
             "auth_mode": creds.get("auth_mode"),
             "source": creds.get("source"),
@@ -6230,7 +6509,7 @@ def get_xai_oauth_auth_status() -> Dict[str, Any]:
     except AuthError as exc:
         return {
             "logged_in": False,
-            "auth_store": str(_auth_file_path()),
+            "auth_store": _keychain_auth_store_descriptor(),
             "error": str(exc),
         }
 

@@ -12,6 +12,7 @@ authenticated only at the global root.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -450,3 +451,123 @@ def test_write_credential_pool_targets_profile_not_global(profile_env):
 
     # Subsequent read returns profile (shadows global).
     assert [e["id"] for e in read_credential_pool("openrouter")] == ["prof-new"]
+
+
+# ---------------------------------------------------------------------------
+# Keychain-backed profile auth stores — no plaintext or global fallback
+# ---------------------------------------------------------------------------
+
+
+def _configure_fake_keychain_auth_store(tmp_path, monkeypatch) -> tuple[Path, Path]:
+    """Configure an executable stdin/stdout test bridge with a temp backing file.
+
+    The backing file contains only test fixtures and stands in for the native
+    macOS Keychain bridge, which is intentionally not exercised in CI.
+    """
+    bridge = tmp_path / "fake-keychain-bridge.py"
+    backing = tmp_path / "test-keychain-item.json"
+    bridge.write_text(
+        """#!/usr/bin/env python3
+import os
+import sys
+from pathlib import Path
+
+path = Path(os.environ[\"HERMES_TEST_KEYCHAIN_DB\"])
+operation = sys.argv[1]
+if operation == \"read\":
+    if not path.exists():
+        raise SystemExit(44)
+    sys.stdout.buffer.write(path.read_bytes())
+elif operation == \"write\":
+    path.write_bytes(sys.stdin.buffer.read())
+else:
+    raise SystemExit(64)
+""",
+        encoding="utf-8",
+    )
+    bridge.chmod(0o700)
+    monkeypatch.setenv("HERMES_AUTH_STORE_MODE", "keychain")
+    monkeypatch.setenv("HERMES_AUTH_KEYCHAIN_BRIDGE", str(bridge))
+    monkeypatch.setenv("HERMES_AUTH_KEYCHAIN_ACCOUNT", "test-user")
+    monkeypatch.setenv("HERMES_AUTH_KEYCHAIN_SERVICE", "ai.hermes.test.auth-store")
+    monkeypatch.setenv("HERMES_AUTH_KEYCHAIN_RECEIPT_PATH", str(tmp_path / "receipts" / "auth.jsonl"))
+    monkeypatch.setenv("HERMES_TEST_KEYCHAIN_DB", str(backing))
+    return backing, tmp_path / "receipts" / "auth.jsonl"
+
+
+def test_keychain_profile_store_round_trip_has_no_plaintext_auth_file(profile_env, tmp_path, monkeypatch):
+    backing, receipt = _configure_fake_keychain_auth_store(tmp_path, monkeypatch)
+    from hermes_cli.auth import _load_auth_store, _save_auth_store
+
+    token = "keychain-test-token-never-in-receipt"
+    store = _make_auth_store(providers={"openai-codex": {"access_token": token}})
+    saved_path = _save_auth_store(store)
+
+    assert saved_path == profile_env["profile"] / "auth.json"
+    assert not saved_path.exists()
+    assert backing.exists()
+    assert _load_auth_store()["providers"]["openai-codex"]["access_token"] == token
+    receipt_text = receipt.read_text(encoding="utf-8")
+    assert "hermes_auth_state_persisted" in receipt_text
+    assert "openai-codex" in receipt_text
+    assert token not in receipt_text
+
+
+def test_keychain_profile_store_disables_global_provider_and_pool_fallback(profile_env, tmp_path, monkeypatch):
+    _configure_fake_keychain_auth_store(tmp_path, monkeypatch)
+    _write(profile_env["global"] / "auth.json", _make_auth_store(
+        providers={"nous": {"access_token": "global-nous-token"}},
+        pool={"openrouter": [{"id": "global", "access_token": "global-key"}]},
+    ))
+
+    from hermes_cli.auth import (
+        _global_auth_file_path,
+        _load_auth_store,
+        _save_auth_store,
+        get_provider_auth_state,
+        read_credential_pool,
+    )
+
+    _save_auth_store(_make_auth_store(providers={"openai-codex": {"access_token": "profile-token"}}))
+    assert _global_auth_file_path() is None
+    assert _load_auth_store()["providers"]["openai-codex"]["access_token"] == "profile-token"
+    assert get_provider_auth_state("nous") is None
+    assert read_credential_pool("openrouter") == []
+
+
+def test_keychain_profile_store_missing_item_fails_closed(profile_env, tmp_path, monkeypatch):
+    _configure_fake_keychain_auth_store(tmp_path, monkeypatch)
+    from hermes_cli.auth import _load_auth_store
+
+    with pytest.raises(RuntimeError, match="Keychain auth store is unavailable"):
+        _load_auth_store()
+
+
+def test_keychain_marker_enables_profile_isolation_without_launcher_env(profile_env, tmp_path, monkeypatch):
+    _backing, receipt = _configure_fake_keychain_auth_store(tmp_path, monkeypatch)
+    state_dir = profile_env["profile"] / "state"
+    state_dir.mkdir()
+    marker = state_dir / "auth-store-keychain.json"
+    marker.write_text(json.dumps({
+        "backend": "keychain",
+        "bridge": os.environ["HERMES_AUTH_KEYCHAIN_BRIDGE"],
+        "account": os.environ["HERMES_AUTH_KEYCHAIN_ACCOUNT"],
+        "service": os.environ["HERMES_AUTH_KEYCHAIN_SERVICE"],
+        "receipt_path": str(receipt),
+    }), encoding="utf-8")
+    marker.chmod(0o600)
+    for name in (
+        "HERMES_AUTH_STORE_MODE",
+        "HERMES_AUTH_KEYCHAIN_BRIDGE",
+        "HERMES_AUTH_KEYCHAIN_ACCOUNT",
+        "HERMES_AUTH_KEYCHAIN_SERVICE",
+        "HERMES_AUTH_KEYCHAIN_RECEIPT_PATH",
+    ):
+        monkeypatch.delenv(name)
+
+    from hermes_cli.auth import _global_auth_file_path, _load_auth_store, _save_auth_store
+
+    _save_auth_store(_make_auth_store(providers={"openai-codex": {"access_token": "marker-token"}}))
+    assert _global_auth_file_path() is None
+    assert _load_auth_store()["providers"]["openai-codex"]["access_token"] == "marker-token"
+    assert not (profile_env["profile"] / "auth.json").exists()

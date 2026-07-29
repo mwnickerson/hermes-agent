@@ -2572,17 +2572,23 @@ def _credential_fingerprint(provider: str) -> str:
     except Exception:
         pass
 
-    # OAuth / external-file mtimes that change on re-auth
+    # OAuth state revision.  The auth module exposes a redacted revision that
+    # uses auth.json mtime for the file backend and `updated_at` for the
+    # Keychain backend, so an OAuth refresh invalidates this cache either way.
+    try:
+        from hermes_cli.auth import get_auth_store_cache_fingerprint
+        parts.append("hermes_auth=" + get_auth_store_cache_fingerprint())
+    except Exception:
+        pass
+
+    # Other profile-local credential files still use their file revision.
     try:
         from hermes_constants import get_hermes_home
-        for rel in ("auth.json", "credentials.json"):
-            p = get_hermes_home() / rel
-            try:
-                parts.append(f"{rel}@{p.stat().st_mtime_ns}")
-            except FileNotFoundError:
-                parts.append(f"{rel}@missing")
-            except Exception:
-                pass
+        p = get_hermes_home() / "credentials.json"
+        try:
+            parts.append(f"credentials.json@{p.stat().st_mtime_ns}")
+        except FileNotFoundError:
+            parts.append("credentials.json@missing")
     except Exception:
         pass
 
