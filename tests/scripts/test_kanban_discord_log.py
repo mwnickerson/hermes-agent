@@ -366,3 +366,48 @@ def test_project_post_is_not_repeated_after_later_side_effect_fails(monkeypatch,
     assert posts == ["project"]
     receipt = state["project_thread_posts"][watcher.state_db_ref()]["44"]
     assert receipt["message_id"] == "message-1"
+
+
+
+def test_explicit_milestone_comment_posts_to_project_thread(monkeypatch, tmp_path):
+    watcher = load_watcher()
+    con = make_db()
+    con.execute(
+        'INSERT INTO tasks(id,title,body,assignee,status,priority,created_at,created_by) VALUES (?,?,?,?,?,?,?,?)',
+        (
+            'root_project',
+            'Delivery acceptance project',
+            'Project Hub slug: delivery-acceptance\nKanban root task id: root_project\nKanban stage: Delivery\n',
+            'antonetta',
+            'done',
+            1,
+            1,
+            '',
+        ),
+    )
+    con.execute(
+        'INSERT INTO tasks(id,title,body,assignee,status,priority,created_at,created_by) VALUES (?,?,?,?,?,?,?,?)',
+        ('verification_task', 'Verify project thread', '', 'antonetta', 'done', 1, 2, ''),
+    )
+    con.execute('INSERT INTO task_links(parent_id,child_id) VALUES (?,?)', ('root_project', 'verification_task'))
+    ev = {
+        'id': 45,
+        'task_id': 'verification_task',
+        'run_id': 1,
+        'kind': 'commented',
+        'payload': json.dumps({'body': 'Milestone: thread narration verified'}),
+        'created_at': 2,
+    }
+    posts = []
+    monkeypatch.setattr(watcher, 'fetch_project_hub_context', lambda _slug: {'title': 'Delivery acceptance', 'status': 'active'})
+    monkeypatch.setattr(watcher, 'create_thread', lambda *_args, **_kwargs: {'id': 'thread-1'})
+    monkeypatch.setattr(watcher, 'post', lambda *_args, **_kwargs: posts.append('project') or {'id': 'message-1'})
+    watcher.STATE_PATH = tmp_path / 'state.json'
+    state = {'last_event_id': 0, 'components': {}, 'task_aliases': {}, 'project_threads': {}}
+
+    result = watcher.route_event(con, state, ev, 'general', 'project', 'red')
+
+    assert result == 'posted-project-thread'
+    assert posts == ['project']
+    receipt = state['project_thread_posts'][watcher.state_db_ref()]['45']
+    assert receipt['message_id'] == 'message-1'
