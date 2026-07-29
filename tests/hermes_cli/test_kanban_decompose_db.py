@@ -87,6 +87,15 @@ def test_decompose_children_inherit_origin_session_and_notification_route(kanban
             user_id="user-9",
             notifier_profile="default",
         )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="discord",
+            chat_id="owner-dm-42",
+            user_id="user-9",
+            notifier_profile="antonetta",
+            delivery_scope=kb.NOTIFY_DELIVERY_SCOPE_OWNER_PROJECT_TERMINAL,
+        )
 
         child_ids = kb.decompose_triage_task(
             conn,
@@ -112,6 +121,7 @@ def test_decompose_children_inherit_origin_session_and_notification_route(kanban
             assert sub["thread_id"] == "thread-7"
             assert sub["user_id"] == "user-9"
             assert sub["notifier_profile"] == "default"
+            assert sub["delivery_scope"] == kb.NOTIFY_DELIVERY_SCOPE_ORIGIN
 
 
 def test_decompose_returns_none_when_task_missing(kanban_home):

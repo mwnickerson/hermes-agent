@@ -422,6 +422,23 @@ class GatewaySlashCommandsMixin:
             text = text[len("kanban"):].lstrip()
 
         tokens = shlex.split(text) if text else []
+        notify_owner = False
+        filtered_tokens = []
+        for token in tokens:
+            if token == "--notify-owner":
+                notify_owner = True
+                continue
+            if token.startswith("--notify-owner="):
+                value = token.split("=", 1)[1].strip().lower()
+                if value in {"true", "1", "yes"}:
+                    notify_owner = True
+                elif value in {"false", "0", "no"}:
+                    notify_owner = False
+                else:
+                    return "--notify-owner must be true or false"
+                continue
+            filtered_tokens.append(token)
+        tokens = filtered_tokens
         requested_board = None
         action = None
         i = 0
@@ -441,6 +458,10 @@ class GatewaySlashCommandsMixin:
             break
 
         is_create = action == "create"
+        is_root_create = is_create and not any(
+            token == "--parent" or token.startswith("--parent=") for token in tokens
+        )
+        text = shlex.join(tokens)
 
         try:
             output = await asyncio.to_thread(run_slash, text)
@@ -486,6 +507,43 @@ class GatewaySlashCommandsMixin:
                         )
                 except Exception as exc:
                     logger.warning("kanban create auto-subscribe failed: %s", exc)
+
+                if notify_owner:
+                    try:
+                        source = event.source
+                        platform = getattr(source, "platform", None)
+                        platform_str = (
+                            platform.value if hasattr(platform, "value") else str(platform or "")
+                        ).lower()
+                        source_user_id = str(getattr(source, "user_id", "") or "")
+                        source_profile = (
+                            getattr(source, "profile", None)
+                            or getattr(self, "_kanban_notifier_profile", None)
+                            or self._active_profile_name()
+                        )
+
+                        def _owner_sub() -> bool:
+                            from hermes_cli import kanban_db as _kb
+                            from tools.kanban_tools import maybe_add_owner_project_terminal_subscription
+
+                            conn = _kb.connect(board=requested_board)
+                            try:
+                                return maybe_add_owner_project_terminal_subscription(
+                                    conn,
+                                    task_id=task_id,
+                                    notify_owner=True,
+                                    is_root=is_root_create,
+                                    source_platform=platform_str,
+                                    source_user_id=source_user_id,
+                                    notifier_profile=source_profile,
+                                )
+                            finally:
+                                conn.close()
+
+                        if await asyncio.to_thread(_owner_sub):
+                            output = output.rstrip() + "\nOwner terminal alert enabled."
+                    except Exception as exc:
+                        logger.warning("kanban owner alert subscription failed: %s", exc)
 
         # Gateway messages have practical length caps; truncate long
         # listings to keep the UX reasonable.

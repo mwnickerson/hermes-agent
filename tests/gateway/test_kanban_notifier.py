@@ -43,6 +43,38 @@ def _make_runner(adapter):
     return runner
 
 
+def _make_owner_runner(adapter):
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._profile_adapters = {"antonetta": {Platform.DISCORD: adapter}}
+    runner._kanban_notifier_profile = "antonetta"
+    runner._kanban_sub_fail_counts = {}
+    return runner
+
+
+def _create_owner_subscription(*, blocked=False):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="owner terminal", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="discord",
+            chat_id="owner-dm-test",
+            user_id="owner-1",
+            notifier_profile="antonetta",
+            delivery_scope=kb.NOTIFY_DELIVERY_SCOPE_OWNER_PROJECT_TERMINAL,
+        )
+        if blocked:
+            kb.block_task(conn, tid, reason="need a decision")
+        else:
+            kb.complete_task(conn, tid, summary="owner handoff")
+        return tid
+    finally:
+        conn.close()
+
+
 def _create_completed_subscription(summary="done once"):
     conn = kb.connect()
     try:
@@ -119,6 +151,95 @@ def test_kanban_completion_notification_uses_human_facing_contract(tmp_path, mon
     assert f"Kanban {tid} succeeded — notify once" in text
     assert "Implemented and verified the fix." in text
     assert f"Inspect: board default / task {tid}" in text
+
+
+def test_owner_direct_notifier_delivers_root_completion_and_blocker(tmp_path, monkeypatch):
+    """Owner routes are profile-scoped and only send concise terminal alerts."""
+    db_path = tmp_path / "owner-direct.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    kb.init_db()
+
+    completed_id = _create_owner_subscription()
+    blocked_id = _create_owner_subscription(blocked=True)
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_owner_runner(adapter)))
+
+    assert len(adapter.sent) == 2
+    completed = next(item["text"] for item in adapter.sent if item["text"].startswith("✔"))
+    blocked = next(item["text"] for item in adapter.sent if item["text"].startswith("⏸"))
+    assert "Project completed:" in completed
+    assert "Review the project record/thread for the full handoff." in completed
+    assert "Project needs your decision:" in blocked
+    assert "need a decision" not in blocked
+    assert "Review the project record/thread for the full handoff." in blocked
+
+
+def test_owner_direct_quiet_hours_defer_completion_but_not_blocker(tmp_path, monkeypatch):
+    """A quiet completion remains unclaimed; blockers still bypass quiet hours."""
+    import gateway.kanban_watchers as watchers
+
+    db_path = tmp_path / "owner-quiet.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    kb.init_db()
+    monkeypatch.setattr(
+        watchers,
+        "_owner_project_terminal_quiet_hours_active",
+        lambda _cfg: True,
+    )
+
+    completed_id = _create_owner_subscription()
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_owner_runner(adapter)))
+    assert adapter.sent == []
+
+    conn = kb.connect()
+    try:
+        _, delayed = kb.unseen_events_for_sub(
+            conn,
+            task_id=completed_id,
+            platform="discord",
+            chat_id="owner-dm-test",
+            delivery_scope=kb.NOTIFY_DELIVERY_SCOPE_OWNER_PROJECT_TERMINAL,
+            kinds=("completed",),
+        )
+    finally:
+        conn.close()
+    assert [event.kind for event in delayed] == ["completed"]
+
+    blocked_id = _create_owner_subscription(blocked=True)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_owner_runner(adapter)))
+    assert len(adapter.sent) == 1
+    assert "Project needs your decision:" in adapter.sent[0]["text"]
+
+
+def test_owner_quiet_hours_supports_overnight_windows_and_fails_open():
+    from datetime import datetime
+
+    from gateway.kanban_watchers import _owner_project_terminal_quiet_hours_active
+
+    cfg = {
+        "owner_alerts": {
+            "quiet_hours": {
+                "enabled": True,
+                "start": "22:00",
+                "end": "07:00",
+            },
+        },
+    }
+    assert _owner_project_terminal_quiet_hours_active(
+        cfg, now=datetime(2026, 7, 28, 23, 0),
+    ) is True
+    assert _owner_project_terminal_quiet_hours_active(
+        cfg, now=datetime(2026, 7, 28, 12, 0),
+    ) is False
+    cfg["owner_alerts"]["quiet_hours"]["start"] = "not-a-time"
+    assert _owner_project_terminal_quiet_hours_active(cfg) is False
 
 
 def test_kanban_notifier_rewinds_claim_if_adapter_disconnects(tmp_path, monkeypatch):

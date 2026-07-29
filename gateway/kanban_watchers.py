@@ -15,6 +15,7 @@ import logging
 import os
 import sqlite3
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -23,6 +24,57 @@ from agent.i18n import t
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
+
+
+def _owner_project_terminal_quiet_hours_active(
+    kanban_cfg: Any,
+    *,
+    now: Optional[datetime] = None,
+) -> bool:
+    """Return whether owner completion alerts should wait for quiet hours.
+
+    Invalid or incomplete configuration leaves delivery enabled.  A direct
+    owner route is already explicit; a malformed quiet-hours setting must not
+    turn into a silent, indefinite suppression of its terminal completion.
+    """
+    if not isinstance(kanban_cfg, dict):
+        return False
+    owner_alerts = kanban_cfg.get("owner_alerts")
+    if not isinstance(owner_alerts, dict):
+        return False
+    quiet_hours = owner_alerts.get("quiet_hours")
+    if not isinstance(quiet_hours, dict) or not quiet_hours.get("enabled"):
+        return False
+    start_raw = str(quiet_hours.get("start") or "").strip()
+    end_raw = str(quiet_hours.get("end") or "").strip()
+    try:
+        start = datetime.strptime(start_raw, "%H:%M").time()
+        end = datetime.strptime(end_raw, "%H:%M").time()
+    except ValueError:
+        return False
+    if start == end:
+        return False
+
+    timezone_name = str(quiet_hours.get("timezone") or "").strip()
+    if timezone_name:
+        try:
+            from zoneinfo import ZoneInfo
+
+            timezone = ZoneInfo(timezone_name)
+            if now is None:
+                now = datetime.now(timezone)
+            elif now.tzinfo is None:
+                now = now.replace(tzinfo=timezone)
+            else:
+                now = now.astimezone(timezone)
+        except Exception:
+            return False
+    elif now is None:
+        now = datetime.now()
+    current = now.time().replace(tzinfo=None)
+    if start < end:
+        return start <= current < end
+    return current >= start or current < end
 
 
 def _resolve_auto_decompose_settings(
@@ -198,6 +250,9 @@ class GatewayKanbanWatchersMixin:
             try:
                 def _collect():
                     deliveries: list[dict] = []
+                    quiet_owner_completions = _owner_project_terminal_quiet_hours_active(
+                        kanban_cfg
+                    )
                     active_platforms = {
                         getattr(platform, "value", str(platform)).lower()
                         for platform in self.adapters.keys()
@@ -252,6 +307,29 @@ class GatewayKanbanWatchersMixin:
                             if not subs:
                                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
                             for sub in subs:
+                                delivery_scope = str(
+                                    sub.get("delivery_scope")
+                                    or _kb.NOTIFY_DELIVERY_SCOPE_ORIGIN
+                                )
+                                if delivery_scope not in {
+                                    _kb.NOTIFY_DELIVERY_SCOPE_ORIGIN,
+                                    _kb.NOTIFY_DELIVERY_SCOPE_OWNER_PROJECT_TERMINAL,
+                                }:
+                                    logger.warning(
+                                        "kanban notifier: subscription for %s has an unknown delivery scope %r; skipping",
+                                        sub.get("task_id"), delivery_scope,
+                                    )
+                                    continue
+                                owner_direct = (
+                                    delivery_scope
+                                    == _kb.NOTIFY_DELIVERY_SCOPE_OWNER_PROJECT_TERMINAL
+                                )
+                                if owner_direct and _kb.parent_ids(conn, sub["task_id"]):
+                                    logger.warning(
+                                        "kanban notifier: ignoring owner terminal subscription on child task %s",
+                                        sub["task_id"],
+                                    )
+                                    continue
                                 owner_profile = sub.get("notifier_profile") or None
                                 if owner_profile and owner_profile != notifier_profile:
                                     _owner_adapters = getattr(self, "_profile_adapters", {}).get(owner_profile)
@@ -274,7 +352,14 @@ class GatewayKanbanWatchersMixin:
                                     platform=sub["platform"],
                                     chat_id=sub["chat_id"],
                                     thread_id=sub.get("thread_id") or "",
-                                    kinds=TERMINAL_KINDS,
+                                    kinds=(
+                                        ("blocked",)
+                                        if owner_direct and quiet_owner_completions
+                                        else ("completed", "blocked")
+                                        if owner_direct
+                                        else TERMINAL_KINDS
+                                    ),
+                                    delivery_scope=delivery_scope,
                                 )
                                 if not events:
                                     continue
@@ -343,7 +428,21 @@ class GatewayKanbanWatchersMixin:
                         # chat subscribes to many tasks) legible at a glance.
                         who = (task.assignee if task and task.assignee else None)
                         tag = f"@{who} " if who else ""
-                        if kind == "completed":
+                        owner_direct = (
+                            sub.get("delivery_scope")
+                            == "owner_project_terminal"
+                        )
+                        if owner_direct:
+                            inspect_ref = "\nReview the project record/thread for the full handoff."
+                            if kind == "completed":
+                                msg = (
+                                    f"✔ Project completed: {title}.{inspect_ref}"
+                                )
+                            else:  # owner-direct claims only completed / blocked
+                                msg = (
+                                    f"⏸ Project needs your decision: {title}.{inspect_ref}"
+                                )
+                        elif kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
                             # in the event payload), then fall back to
@@ -416,6 +515,7 @@ class GatewayKanbanWatchersMixin:
                         sub_key = (
                             sub["task_id"], sub["platform"],
                             sub["chat_id"], sub.get("thread_id") or "",
+                            sub.get("delivery_scope") or "origin",
                         )
                         try:
                             await adapter.send(
@@ -434,7 +534,7 @@ class GatewayKanbanWatchersMixin:
                             # ``send_document`` / ``send_image_file`` uploads
                             # them. Only fires on the ``completed`` event so
                             # we never spam attachments on retries.
-                            if kind == "completed":
+                            if kind == "completed" and not owner_direct:
                                 try:
                                     await self._deliver_kanban_artifacts(
                                         adapter=adapter,
@@ -496,7 +596,10 @@ class GatewayKanbanWatchersMixin:
                         task_terminal = task and task.status in {"done", "archived"}
                         _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
                         _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
-                        if _wake_kinds:
+                        if _wake_kinds and not (
+                            sub.get("delivery_scope")
+                            == "owner_project_terminal"
+                        ):
                             try:
                                 _session_key = getattr(task, "session_id", None) or ""
                                 if _session_key:
@@ -596,6 +699,7 @@ class GatewayKanbanWatchersMixin:
                 chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "",
                 new_cursor=cursor,
+                delivery_scope=sub.get("delivery_scope") or "origin",
             )
         finally:
             conn.close()
@@ -610,6 +714,7 @@ class GatewayKanbanWatchersMixin:
                 platform=sub["platform"],
                 chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "",
+                delivery_scope=sub.get("delivery_scope") or "origin",
             )
         finally:
             conn.close()
@@ -633,6 +738,7 @@ class GatewayKanbanWatchersMixin:
                 thread_id=sub.get("thread_id") or "",
                 claimed_cursor=claimed_cursor,
                 old_cursor=old_cursor,
+                delivery_scope=sub.get("delivery_scope") or "origin",
             )
         finally:
             conn.close()

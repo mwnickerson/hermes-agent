@@ -2295,3 +2295,132 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
     d = json.loads(out)
     assert d["ok"] is True, d
     assert d["subscribed"] is False, d
+
+
+def test_create_owner_terminal_alert_is_root_discord_opt_in(monkeypatch, worker_env):
+    """A sole authorized Discord owner can opt a root card into direct alerts."""
+    from pathlib import Path
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "project-thread")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", "owner-1")
+    monkeypatch.setenv("HERMES_SESSION_PROFILE", "antonetta")
+    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "owner-1")
+    monkeypatch.delenv("DISCORD_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("DISCORD_ALLOWED_ROLES", raising=False)
+    (Path(os.environ["HERMES_HOME"]) / "config.yaml").write_text(
+        "kanban:\n"
+        "  owner_alerts:\n"
+        "    enabled: true\n"
+        "    discord_dm_channel_id: owner-dm-test\n"
+    )
+
+    root = json.loads(kt._handle_create({
+        "title": "root owner alert",
+        "assignee": "peer",
+        "notify_owner": True,
+    }))
+    assert root["ok"] is True
+    assert root["owner_alert_subscribed"] is True
+
+    root_subs = _list_subs_for_task(root["task_id"])
+    owner_subs = [
+        sub for sub in root_subs
+        if sub["delivery_scope"] == kb.NOTIFY_DELIVERY_SCOPE_OWNER_PROJECT_TERMINAL
+    ]
+    assert len(owner_subs) == 1
+    assert owner_subs[0]["platform"] == "discord"
+    assert owner_subs[0]["chat_id"] == "owner-dm-test"
+    assert owner_subs[0]["notifier_profile"] == "antonetta"
+
+    child = json.loads(kt._handle_create({
+        "title": "child must not owner-alert",
+        "assignee": "peer",
+        "parents": [root["task_id"]],
+        "notify_owner": True,
+    }))
+    assert child["ok"] is True
+    assert child["owner_alert_subscribed"] is False
+    child_subs = _list_subs_for_task(child["task_id"])
+    assert [sub["delivery_scope"] for sub in child_subs] == [
+        kb.NOTIFY_DELIVERY_SCOPE_ORIGIN
+    ]
+
+
+@pytest.mark.parametrize(
+    ("config_text", "allowed_users"),
+    [
+        ("kanban:\n  owner_alerts:\n    enabled: true\n", "owner-1"),
+        (
+            "kanban:\n  owner_alerts:\n    enabled: true\n"
+            "    discord_dm_channel_id: owner-dm-test\n",
+            "owner-1,another-user",
+        ),
+    ],
+)
+def test_owner_terminal_alert_fails_closed_for_missing_or_ambiguous_config(
+    monkeypatch, worker_env, config_text, allowed_users,
+):
+    """No route is created when the recipient configuration is not exact."""
+    from pathlib import Path
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    (Path(os.environ["HERMES_HOME"]) / "config.yaml").write_text(config_text)
+    monkeypatch.setenv("DISCORD_ALLOWED_USERS", allowed_users)
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="owner config gate", assignee="peer")
+        assert kt.maybe_add_owner_project_terminal_subscription(
+            conn,
+            task_id=task_id,
+            notify_owner=True,
+            is_root=True,
+            source_platform="discord",
+            source_user_id="owner-1",
+            notifier_profile="antonetta",
+        ) is False
+        assert kb.list_notify_subs(conn, task_id) == []
+    finally:
+        conn.close()
+
+
+def test_owner_terminal_alert_is_bound_to_antonetta_profile(monkeypatch, worker_env):
+    from pathlib import Path
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    (Path(os.environ["HERMES_HOME"]) / "config.yaml").write_text(
+        "kanban:\n"
+        "  owner_alerts:\n"
+        "    enabled: true\n"
+        "    discord_dm_channel_id: owner-dm-test\n"
+    )
+    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "owner-1")
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="wrong profile", assignee="peer")
+        assert kt.maybe_add_owner_project_terminal_subscription(
+            conn,
+            task_id=task_id,
+            notify_owner=True,
+            is_root=True,
+            source_platform="discord",
+            source_user_id="owner-1",
+            notifier_profile="default",
+        ) is False
+        assert kb.list_notify_subs(conn, task_id) == []
+    finally:
+        conn.close()
+
+
+def test_create_schema_exposes_explicit_owner_alert_opt_in():
+    from tools.kanban_tools import KANBAN_CREATE_SCHEMA
+
+    assert KANBAN_CREATE_SCHEMA["parameters"]["properties"]["notify_owner"]["type"] == "boolean"

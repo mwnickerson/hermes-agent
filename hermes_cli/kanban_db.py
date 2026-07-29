@@ -1258,9 +1258,10 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     thread_id     TEXT NOT NULL DEFAULT '',
     user_id       TEXT,
     notifier_profile TEXT,
+    delivery_scope TEXT NOT NULL DEFAULT 'origin',
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (task_id, platform, chat_id, thread_id)
+    PRIMARY KEY (task_id, platform, chat_id, thread_id, delivery_scope)
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
@@ -2149,9 +2150,10 @@ _REBUILD_SPECS = {
         "CREATE TABLE kanban_notify_subs ("
         " task_id TEXT NOT NULL, platform TEXT NOT NULL, chat_id TEXT NOT NULL,"
         " thread_id TEXT NOT NULL DEFAULT '', user_id TEXT,"
-        " notifier_profile TEXT, created_at INTEGER NOT NULL,"
+        " notifier_profile TEXT, delivery_scope TEXT NOT NULL DEFAULT 'origin',"
+        " created_at INTEGER NOT NULL,"
         " last_event_id INTEGER NOT NULL DEFAULT 0,"
-        " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
+        " PRIMARY KEY (task_id, platform, chat_id, thread_id, delivery_scope))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
     ),
 }
@@ -2164,7 +2166,21 @@ def _table_has_drifted(conn: sqlite3.Connection, table: str) -> bool:
         return False  # table absent — nothing to rebuild
     if table == "kanban_notify_subs":
         lei = next((c for c in info if c["name"] == "last_event_id"), None)
-        return lei is not None and (lei["type"] or "").upper() != "INTEGER"
+        scope = next((c for c in info if c["name"] == "delivery_scope"), None)
+        pk_columns = [
+            c["name"] for c in sorted(info, key=lambda c: c["pk"])
+            if c["pk"]
+        ]
+        return (
+            lei is None
+            or (lei["type"] or "").upper() != "INTEGER"
+            or scope is None
+            or (scope["type"] or "").upper() != "TEXT"
+            or not scope["notnull"]
+            or pk_columns != [
+                "task_id", "platform", "chat_id", "thread_id", "delivery_scope",
+            ]
+        )
     # task_events / task_comments / task_runs: id must be INTEGER and a PK.
     id_col = next((c for c in info if c["name"] == "id"), None)
     if id_col is None:
@@ -2205,11 +2221,22 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
             new_cols = {c["name"] for c in conn.execute(f"PRAGMA table_info({table})")}
             if table == "kanban_notify_subs":
                 # Cast the legacy TEXT cursor to INTEGER; NULL / non-numeric → 0.
-                shared = [c for c in old_cols if c in new_cols and c != "last_event_id"]
-                cols_csv = ", ".join(shared)
+                shared = [
+                    c for c in old_cols
+                    if c in new_cols and c not in {"last_event_id", "delivery_scope"}
+                ]
+                insert_cols = [*shared, "delivery_scope", "last_event_id"]
+                select_cols = [*shared]
+                if "delivery_scope" in old_cols:
+                    select_cols.append(
+                        "COALESCE(NULLIF(delivery_scope, ''), 'origin')"
+                    )
+                else:
+                    select_cols.append("'origin'")
+                select_cols.append("COALESCE(CAST(last_event_id AS INTEGER), 0)")
                 conn.execute(
-                    f"INSERT INTO {table} ({cols_csv}, last_event_id) "
-                    f"SELECT {cols_csv}, COALESCE(CAST(last_event_id AS INTEGER), 0) "
+                    f"INSERT INTO {table} ({', '.join(insert_cols)}) "
+                    f"SELECT {', '.join(select_cols)} "
                     f"FROM {table}_legacy"
                 )
             else:
@@ -5092,8 +5119,8 @@ def decompose_triage_task(
         root_session_id = root_row["session_id"]
         root_subscriptions = conn.execute(
             "SELECT platform, chat_id, thread_id, user_id, notifier_profile "
-            "FROM kanban_notify_subs WHERE task_id = ?",
-            (task_id,),
+            "FROM kanban_notify_subs WHERE task_id = ? AND delivery_scope = ?",
+            (task_id, NOTIFY_DELIVERY_SCOPE_ORIGIN),
         ).fetchall()
 
         # Create children. Status is 'todo' regardless of parents — we
@@ -5148,8 +5175,8 @@ def decompose_triage_task(
                 conn.execute(
                     "INSERT OR IGNORE INTO kanban_notify_subs "
                     "(task_id, platform, chat_id, thread_id, user_id, "
-                    " notifier_profile, created_at, last_event_id) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
+                    " notifier_profile, delivery_scope, created_at, last_event_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
                     (
                         new_id,
                         sub["platform"],
@@ -5157,6 +5184,7 @@ def decompose_triage_task(
                         sub["thread_id"] or "",
                         sub["user_id"],
                         sub["notifier_profile"],
+                        NOTIFY_DELIVERY_SCOPE_ORIGIN,
                         now,
                     ),
                 )
@@ -8287,6 +8315,21 @@ def task_age(task: Task) -> dict:
 # Notification subscriptions (used by the gateway kanban-notifier)
 # ---------------------------------------------------------------------------
 
+NOTIFY_DELIVERY_SCOPE_ORIGIN = "origin"
+NOTIFY_DELIVERY_SCOPE_OWNER_PROJECT_TERMINAL = "owner_project_terminal"
+_VALID_NOTIFY_DELIVERY_SCOPES = frozenset({
+    NOTIFY_DELIVERY_SCOPE_ORIGIN,
+    NOTIFY_DELIVERY_SCOPE_OWNER_PROJECT_TERMINAL,
+})
+
+
+def _normalize_notify_delivery_scope(value: Optional[str]) -> str:
+    scope = str(value or NOTIFY_DELIVERY_SCOPE_ORIGIN).strip()
+    if scope not in _VALID_NOTIFY_DELIVERY_SCOPES:
+        raise ValueError(f"unknown notification delivery scope: {scope!r}")
+    return scope
+
+
 def add_notify_sub(
     conn: sqlite3.Connection,
     *,
@@ -8296,18 +8339,24 @@ def add_notify_sub(
     thread_id: Optional[str] = None,
     user_id: Optional[str] = None,
     notifier_profile: Optional[str] = None,
+    delivery_scope: str = NOTIFY_DELIVERY_SCOPE_ORIGIN,
 ) -> None:
     """Register a gateway source that wants terminal-state notifications
-    for ``task_id``. Idempotent on (task, platform, chat, thread)."""
+    for ``task_id``. Idempotent on (task, platform, chat, thread, scope)."""
+    scope = _normalize_notify_delivery_scope(delivery_scope)
     now = int(time.time())
     with write_txn(conn):
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
-                (task_id, platform, chat_id, thread_id, user_id, notifier_profile, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (task_id, platform, chat_id, thread_id, user_id, notifier_profile,
+                 delivery_scope, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (task_id, platform, chat_id, thread_id or "", user_id, notifier_profile, now),
+            (
+                task_id, platform, chat_id, thread_id or "", user_id,
+                notifier_profile, scope, now,
+            ),
         )
         if notifier_profile:
             # Self-heal legacy rows that predate notifier ownership by
@@ -8317,9 +8366,12 @@ def add_notify_sub(
                 UPDATE kanban_notify_subs
                    SET notifier_profile = ?
                  WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+                   AND delivery_scope = ?
                    AND (notifier_profile IS NULL OR notifier_profile = '')
                 """,
-                (notifier_profile, task_id, platform, chat_id, thread_id or ""),
+                (
+                    notifier_profile, task_id, platform, chat_id, thread_id or "", scope,
+                ),
             )
 
 
@@ -8342,12 +8394,15 @@ def remove_notify_sub(
     platform: str,
     chat_id: str,
     thread_id: Optional[str] = None,
+    delivery_scope: str = NOTIFY_DELIVERY_SCOPE_ORIGIN,
 ) -> bool:
+    scope = _normalize_notify_delivery_scope(delivery_scope)
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM kanban_notify_subs WHERE task_id = ? "
-            "AND platform = ? AND chat_id = ? AND thread_id = ?",
-            (task_id, platform, chat_id, thread_id or ""),
+            "AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND delivery_scope = ?",
+            (task_id, platform, chat_id, thread_id or "", scope),
         )
     return cur.rowcount > 0
 
@@ -8360,6 +8415,7 @@ def unseen_events_for_sub(
     chat_id: str,
     thread_id: Optional[str] = None,
     kinds: Optional[Iterable[str]] = None,
+    delivery_scope: str = NOTIFY_DELIVERY_SCOPE_ORIGIN,
 ) -> tuple[int, list[Event]]:
     """Return ``(new_cursor, events)`` for a given subscription.
 
@@ -8367,10 +8423,12 @@ def unseen_events_for_sub(
     cursor is NOT advanced here; call :func:`advance_notify_cursor` after
     the gateway has successfully delivered the notifications.
     """
+    scope = _normalize_notify_delivery_scope(delivery_scope)
     row = conn.execute(
         "SELECT last_event_id FROM kanban_notify_subs "
-        "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
-        (task_id, platform, chat_id, thread_id or ""),
+        "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+        "AND delivery_scope = ?",
+        (task_id, platform, chat_id, thread_id or "", scope),
     ).fetchone()
     if row is None:
         return 0, []
@@ -8409,6 +8467,7 @@ def claim_unseen_events_for_sub(
     chat_id: str,
     thread_id: Optional[str] = None,
     kinds: Optional[Iterable[str]] = None,
+    delivery_scope: str = NOTIFY_DELIVERY_SCOPE_ORIGIN,
 ) -> tuple[int, int, list[Event]]:
     """Atomically claim unseen notification events for one subscription.
 
@@ -8424,11 +8483,13 @@ def claim_unseen_events_for_sub(
     ``new_cursor`` on success or call :func:`rewind_notify_cursor` if delivery
     failed before any terminal unsubscribe removed the row.
     """
+    scope = _normalize_notify_delivery_scope(delivery_scope)
     with write_txn(conn):
         row = conn.execute(
             "SELECT last_event_id FROM kanban_notify_subs "
-            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
-            (task_id, platform, chat_id, thread_id or ""),
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND delivery_scope = ?",
+            (task_id, platform, chat_id, thread_id or "", scope),
         ).fetchone()
         if row is None:
             return 0, 0, []
@@ -8440,14 +8501,18 @@ def claim_unseen_events_for_sub(
             chat_id=chat_id,
             thread_id=thread_id,
             kinds=kinds,
+            delivery_scope=scope,
         )
         if not events:
             return old_cursor, old_cursor, []
         conn.execute(
             "UPDATE kanban_notify_subs SET last_event_id = ? "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
-            "AND last_event_id = ?",
-            (int(new_cursor), task_id, platform, chat_id, thread_id or "", int(old_cursor)),
+            "AND delivery_scope = ? AND last_event_id = ?",
+            (
+                int(new_cursor), task_id, platform, chat_id, thread_id or "", scope,
+                int(old_cursor),
+            ),
         )
         return old_cursor, new_cursor, events
 
@@ -8460,12 +8525,15 @@ def advance_notify_cursor(
     chat_id: str,
     thread_id: Optional[str] = None,
     new_cursor: int,
+    delivery_scope: str = NOTIFY_DELIVERY_SCOPE_ORIGIN,
 ) -> None:
+    scope = _normalize_notify_delivery_scope(delivery_scope)
     with write_txn(conn):
         conn.execute(
             "UPDATE kanban_notify_subs SET last_event_id = ? "
-            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
-            (int(new_cursor), task_id, platform, chat_id, thread_id or ""),
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND delivery_scope = ?",
+            (int(new_cursor), task_id, platform, chat_id, thread_id or "", scope),
         )
 
 
@@ -8478,6 +8546,7 @@ def rewind_notify_cursor(
     thread_id: Optional[str] = None,
     claimed_cursor: int,
     old_cursor: int,
+    delivery_scope: str = NOTIFY_DELIVERY_SCOPE_ORIGIN,
 ) -> bool:
     """Undo a notification claim when delivery fails.
 
@@ -8485,13 +8554,14 @@ def rewind_notify_cursor(
     claim. This keeps retry behavior for transient send failures without
     clobbering newer progress.
     """
+    scope = _normalize_notify_delivery_scope(delivery_scope)
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE kanban_notify_subs SET last_event_id = ? "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
-            "AND last_event_id = ?",
+            "AND delivery_scope = ? AND last_event_id = ?",
             (
-                int(old_cursor), task_id, platform, chat_id, thread_id or "",
+                int(old_cursor), task_id, platform, chat_id, thread_id or "", scope,
                 int(claimed_cursor),
             ),
         )

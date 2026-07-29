@@ -490,6 +490,52 @@ async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
 
 
 @pytest.mark.asyncio
+async def test_gateway_create_owner_alert_opt_in_is_direct_root_only(kanban_home, monkeypatch):
+    """The slash flag creates the dedicated owner scope without leaking to children."""
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n"
+        "  owner_alerts:\n"
+        "    enabled: true\n"
+        "    discord_dm_channel_id: owner-dm-test\n"
+    )
+    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "owner-1")
+    monkeypatch.delenv("DISCORD_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("DISCORD_ALLOWED_ROLES", raising=False)
+    runner = object.__new__(GatewayRunner)
+    runner._kanban_notifier_profile = "antonetta"
+    source = SimpleNamespace(
+        platform=Platform.DISCORD,
+        chat_id="project-thread",
+        thread_id="thread-1",
+        user_id="owner-1",
+        profile="antonetta",
+    )
+    event = SimpleNamespace(
+        text='/kanban create "owner root" --assignee worker --notify-owner',
+        source=source,
+    )
+
+    out = await GatewayRunner._handle_kanban_command(runner, event)
+    assert "Owner terminal alert enabled." in out
+    conn = kb.connect()
+    try:
+        tasks = kb.list_tasks(conn)
+        assert len(tasks) == 1
+        subs = kb.list_notify_subs(conn, tasks[0].id)
+    finally:
+        conn.close()
+    assert {
+        sub["delivery_scope"] for sub in subs
+    } == {
+        kb.NOTIFY_DELIVERY_SCOPE_ORIGIN,
+        kb.NOTIFY_DELIVERY_SCOPE_OWNER_PROJECT_TERMINAL,
+    }
+
+
+@pytest.mark.asyncio
 async def test_notifier_uploads_artifacts_on_completion(kanban_home, tmp_path, monkeypatch):
     """When a completed event carries ``artifacts`` in its payload, the
     notifier uploads each file to the subscribed chat as a native

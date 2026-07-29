@@ -1491,6 +1491,19 @@ DEFAULT_CONFIG = {
         # behaviour — e.g. for a profile that prefers explicit
         # ``kanban_notify-subscribe`` calls per task.
         "auto_subscribe_on_create": True,
+        # Direct owner terminal alerts are opt-in and only created from an
+        # authorized single-user Discord gateway context. The channel id is a
+        # nonsecret Discord destination; leave it empty to keep this disabled.
+        "owner_alerts": {
+            "enabled": False,
+            "discord_dm_channel_id": "",
+            "quiet_hours": {
+                "enabled": False,
+                "start": "",
+                "end": "",
+                "timezone": "",
+            },
+        },
     },
 
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).

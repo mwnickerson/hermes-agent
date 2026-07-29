@@ -40,6 +40,8 @@ from hermes_cli.config import cfg_get, load_config
 
 logger = logging.getLogger(__name__)
 
+_OWNER_PROJECT_TERMINAL_PROFILE = "antonetta"
+
 
 # ---------------------------------------------------------------------------
 # Gating
@@ -831,6 +833,101 @@ def _handle_comment(args: dict, **kw) -> str:
         return tool_error(f"kanban_comment: {e}")
 
 
+def maybe_add_owner_project_terminal_subscription(
+    conn: Any,
+    *,
+    task_id: str,
+    notify_owner: bool,
+    is_root: bool,
+    source_platform: Optional[str],
+    source_user_id: Optional[str],
+    notifier_profile: Optional[str],
+) -> bool:
+    """Persist the opt-in owner terminal route only when it is safe.
+
+    The route is deliberately independent of the origin subscription: it is
+    restricted to root cards, a Discord gateway context, and exactly one
+    explicitly allowed Discord user. Missing/ambiguous config or identity is a
+    no-op so CLI, cron, and unattached callers never invent a recipient.
+    """
+    if not notify_owner or not is_root:
+        return False
+    platform = str(source_platform or "").strip().lower()
+    user_id = str(source_user_id or "").strip()
+    profile = str(notifier_profile or "").strip()
+    if (
+        platform != "discord"
+        or not user_id
+        or profile != _OWNER_PROJECT_TERMINAL_PROFILE
+    ):
+        return False
+    if os.getenv("DISCORD_ALLOW_ALL_USERS", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }:
+        return False
+    if os.getenv("DISCORD_ALLOWED_ROLES", "").strip():
+        return False
+    allowed_users = {
+        value.strip()
+        for value in os.getenv("DISCORD_ALLOWED_USERS", "").split(",")
+        if value.strip()
+    }
+    if len(allowed_users) != 1 or "*" in allowed_users or user_id not in allowed_users:
+        return False
+    try:
+        cfg = load_config()
+        if not cfg_get(cfg, "kanban", "owner_alerts", "enabled", default=False):
+            return False
+        destination = str(
+            cfg_get(
+                cfg,
+                "kanban",
+                "owner_alerts",
+                "discord_dm_channel_id",
+                default="",
+            )
+            or ""
+        ).strip()
+    except Exception:
+        logger.warning("owner project terminal subscription configuration unavailable")
+        return False
+    if not destination:
+        return False
+    try:
+        from hermes_cli import kanban_db as _kb
+        _kb.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="discord",
+            chat_id=destination,
+            user_id=user_id,
+            notifier_profile=profile,
+            delivery_scope=_kb.NOTIFY_DELIVERY_SCOPE_OWNER_PROJECT_TERMINAL,
+        )
+    except Exception:
+        logger.warning("owner project terminal subscription failed for task %s", task_id)
+        return False
+    return True
+
+
+def _session_owner_alert_context() -> tuple[str, str, str]:
+    """Return the current gateway identity without fabricating a fallback."""
+    try:
+        from gateway.session_context import get_session_env
+        return (
+            get_session_env("HERMES_SESSION_PLATFORM", ""),
+            get_session_env("HERMES_SESSION_USER_ID", ""),
+            get_session_env("HERMES_SESSION_PROFILE", "")
+            or os.environ.get("HERMES_PROFILE", ""),
+        )
+    except Exception:
+        return (
+            os.environ.get("HERMES_SESSION_PLATFORM", ""),
+            os.environ.get("HERMES_SESSION_USER_ID", ""),
+            os.environ.get("HERMES_PROFILE", ""),
+        )
+
+
 def _handle_create(args: dict, **kw) -> str:
     """Create a child task. Orchestrator workers use this to fan out.
 
@@ -884,6 +981,9 @@ def _handle_create(args: dict, **kw) -> str:
     goal_mode, goal_bool_error = _parse_bool_arg(args, "goal_mode")
     if goal_bool_error:
         return tool_error(goal_bool_error)
+    notify_owner, notify_owner_error = _parse_bool_arg(args, "notify_owner")
+    if notify_owner_error:
+        return tool_error(notify_owner_error)
     goal_max_turns = args.get("goal_max_turns")
     if isinstance(parents, str):
         parents = [parents]
@@ -900,6 +1000,7 @@ def _handle_create(args: dict, **kw) -> str:
             # worker run, not the human session that commissioned the tree.
             _self_tid = os.environ.get("HERMES_KANBAN_TASK")
             _self_task = kb.get_task(conn, _self_tid) if _self_tid else None
+            is_root = not parents and _self_tid is None
             if _self_task is not None and not args.get("session_id"):
                 session_id = _self_task.session_id or session_id
             if _inherit_workspace:
@@ -943,10 +1044,21 @@ def _handle_create(args: dict, **kw) -> str:
             subscribed = _maybe_auto_subscribe(
                 conn, new_tid, inherit_from=subscription_sources,
             )
+            source_platform, source_user_id, notifier_profile = _session_owner_alert_context()
+            owner_alert_subscribed = maybe_add_owner_project_terminal_subscription(
+                conn,
+                task_id=new_tid,
+                notify_owner=notify_owner,
+                is_root=is_root,
+                source_platform=source_platform,
+                source_user_id=source_user_id,
+                notifier_profile=notifier_profile,
+            )
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
                 subscribed=subscribed,
+                owner_alert_subscribed=owner_alert_subscribed,
             )
         finally:
             conn.close()
@@ -1021,6 +1133,11 @@ def _maybe_auto_subscribe(
         from hermes_cli import kanban_db as _kb
         for source_id in inherit_from or []:
             for sub in _kb.list_notify_subs(conn, source_id):
+                if (
+                    sub.get("delivery_scope", _kb.NOTIFY_DELIVERY_SCOPE_ORIGIN)
+                    != _kb.NOTIFY_DELIVERY_SCOPE_ORIGIN
+                ):
+                    continue
                 _kb.add_notify_sub(
                     conn,
                     task_id=task_id,
@@ -1029,6 +1146,7 @@ def _maybe_auto_subscribe(
                     thread_id=sub.get("thread_id") or None,
                     user_id=sub.get("user_id"),
                     notifier_profile=sub.get("notifier_profile"),
+                    delivery_scope=_kb.NOTIFY_DELIVERY_SCOPE_ORIGIN,
                 )
                 inherited = True
     except Exception as _exc:
@@ -1556,6 +1674,14 @@ KANBAN_CREATE_SCHEMA = {
                     "task, ['github-code-review'] for a reviewer task. "
                     "The names must match skills installed on the "
                     "assignee's profile."
+                ),
+            },
+            "notify_owner": {
+                "type": "boolean",
+                "description": (
+                    "Opt in to one direct Discord completion/blocker alert for "
+                    "this root task. It is ignored for child tasks and only "
+                    "works in an authorized single-user Discord gateway context."
                 ),
             },
             "goal_mode": {
