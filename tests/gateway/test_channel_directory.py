@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import sys
 import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -17,6 +18,7 @@ from gateway.channel_directory import (
     _build_from_sessions,
     _build_slack,
 )
+import gateway.channel_directory as channel_directory
 
 
 import pytest
@@ -29,7 +31,8 @@ def _isolate_channel_aliases(tmp_path_factory):
     that exercise aliases patch CHANNEL_ALIASES_PATH themselves inside the
     test body, which takes precedence over this outer patch."""
     missing = tmp_path_factory.mktemp("aliases") / "none.json"
-    with patch("gateway.channel_directory.CHANNEL_ALIASES_PATH", missing):
+    with patch("gateway.channel_directory.CHANNEL_ALIASES_PATH", missing), \
+         patch("gateway.channel_directory.load_config_readonly", return_value={}):
         yield
 
 
@@ -93,8 +96,8 @@ class TestBuildChannelDirectoryOffload:
         loop_thread = threading.get_ident()
         builder_threads = []
 
-        def fake_build_discord(_adapter):
-            builder_threads.append(threading.get_ident())
+        def fake_build_discord(_adapter, *, scoped_ids=None):
+            builder_threads.append((threading.get_ident(), scoped_ids))
             return []
 
         with patch("gateway.channel_directory._build_discord", side_effect=fake_build_discord), \
@@ -102,7 +105,143 @@ class TestBuildChannelDirectoryOffload:
             asyncio.run(build_channel_directory({Platform.DISCORD: object()}))
 
         assert builder_threads
-        assert all(tid != loop_thread for tid in builder_threads)
+        assert all(tid != loop_thread for tid, _ in builder_threads)
+        assert [scope for _, scope in builder_threads] == [None]
+
+    def test_scoped_config_passes_configured_discord_scope(self, tmp_path):
+        from gateway.config import Platform
+
+        cache_file = tmp_path / "channel_directory.json"
+        requested_scopes = []
+
+        def fake_build_discord(_adapter, *, scoped_ids=None):
+            requested_scopes.append(scoped_ids)
+            return []
+
+        with patch("gateway.channel_directory._build_discord", side_effect=fake_build_discord), \
+             patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             patch("gateway.channel_directory._gateway_discord_scope", return_value=({"222"}, set())), \
+             patch(
+                 "gateway.channel_directory.load_config_readonly",
+                 return_value={"channel_directory": {"discord_discovery": "scoped"}, "discord": {"allowed_channels": ["111"]}},
+             ):
+            asyncio.run(build_channel_directory({Platform.DISCORD: object()}))
+
+        assert requested_scopes == [{"111", "222"}]
+
+    def test_scoped_target_check_admits_gateway_home_but_not_thread_only(self):
+        config = {"channel_directory": {"discord_discovery": "scoped"}, "discord": {}}
+        with patch("gateway.channel_directory._load_channel_directory_config", return_value=config), \
+             patch("gateway.channel_directory._gateway_discord_scope", return_value=({"111"}, set())), \
+             patch("gateway.channel_directory._build_from_sessions", return_value=[]):
+            assert channel_directory.discord_target_is_scoped("111") is True
+            assert channel_directory.discord_target_is_scoped("999", thread_id="111") is False
+
+    def test_scoped_target_rejects_an_unscoped_child_thread(self):
+        config = {"channel_directory": {"discord_discovery": "scoped"}, "discord": {"allowed_channels": ["111"]}}
+        with patch("gateway.channel_directory._load_channel_directory_config", return_value=config), \
+             patch("gateway.channel_directory._gateway_discord_scope", return_value=(set(), set())), \
+             patch("gateway.channel_directory._build_from_sessions", return_value=[]):
+            assert channel_directory.discord_target_is_scoped("111", thread_id="999") is False
+
+    def test_scoped_builder_keeps_profile_local_sessions_and_excludes_unscoped_guilds(self, monkeypatch):
+        session_entry = {"id": "111", "name": "known-session", "type": "channel", "thread_id": None}
+        guild_channel = SimpleNamespace(id=222, name="undiscovered", type="channel")
+        guild = SimpleNamespace(name="shared-guild", text_channels=[guild_channel], forum_channels=[])
+        adapter = SimpleNamespace(_client=SimpleNamespace(guilds=[guild]))
+        monkeypatch.setitem(sys.modules, "discord", SimpleNamespace())
+        monkeypatch.setattr(channel_directory, "_build_from_sessions", lambda platform: [session_entry])
+
+        entries = channel_directory._build_discord(adapter, scoped_ids=set())
+
+        assert entries == [session_entry]
+
+    def test_scoped_aliases_cannot_inject_undiscovered_discord_targets(self):
+        platforms = {"discord": [{"id": "111", "name": "original", "type": "channel"}]}
+        with patch("gateway.channel_directory._load_channel_aliases", return_value={"discord": {"111": "renamed", "222": "undiscovered"}}):
+            _apply_channel_aliases(platforms, scoped_discord=True)
+        assert platforms["discord"] == [{"id": "111", "name": "renamed", "type": "channel"}]
+
+    def test_scoped_load_filters_preexisting_directory_before_aliases(self, tmp_path):
+        cache_file = _write_directory(tmp_path, {"discord": [{"id": "111", "name": "allowed", "type": "channel"}, {"id": "999", "name": "stale", "type": "channel"}]})
+        config = {"channel_directory": {"discord_discovery": "scoped"}, "discord": {"allowed_channels": ["111"]}}
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             patch("gateway.channel_directory._load_channel_directory_config", return_value=config), \
+             patch("gateway.channel_directory._gateway_discord_scope", return_value=(set(), set())), \
+             patch("gateway.channel_directory._build_from_sessions", return_value=[]), \
+             patch("gateway.channel_directory._load_channel_aliases", return_value={"discord": {"999": "cannot-return"}}):
+            result = load_directory()
+        assert result["platforms"]["discord"] == [{"id": "111", "name": "allowed", "type": "channel"}]
+
+    def test_scoped_target_check_enforces_configured_and_session_ids(self):
+        config = {"channel_directory": {"discord_discovery": "scoped"}, "discord": {"allowed_channels": ["111"]}}
+        with patch("gateway.channel_directory._load_channel_directory_config", return_value=config), \
+             patch("gateway.channel_directory._gateway_discord_scope", return_value=(set(), set())), \
+             patch("gateway.channel_directory._build_from_sessions", return_value=[{"id": "222:333", "name": "session", "type": "channel"}]):
+            assert channel_directory.discord_target_is_scoped("111") is True
+            assert channel_directory.discord_target_is_scoped("222") is True
+            assert channel_directory.discord_target_is_scoped("999") is False
+
+    def test_scoped_routing_admits_skill_bindings_and_override_keys(self):
+        config = {
+            "channel_directory": {"discord_discovery": "scoped"},
+            "discord": {
+                "channel_skill_bindings": [{"id": "222", "skills": ["triage"]}],
+                "channel_overrides": {"333": {"model": "test"}},
+            },
+        }
+        with patch("gateway.channel_directory._gateway_discord_scope", return_value=(set(), set())):
+            scope = channel_directory._configured_discord_scope(config)
+        assert scope is not None
+        assert {"222", "333"} <= scope.parent_ids
+        assert {"222", "333"} <= scope.thread_ids
+
+    def test_scoped_load_removes_cached_unscoped_child_threads(self, tmp_path):
+        cache_file = _write_directory(tmp_path, {"discord": [
+            {"id": "111:222", "name": "known", "type": "channel"},
+            {"id": "111:999", "name": "unscoped", "type": "channel"},
+        ]})
+        config = {
+            "channel_directory": {"discord_discovery": "scoped"},
+            "discord": {"allowed_channels": ["111"], "channel_overrides": {"222": {}}},
+        }
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             patch("gateway.channel_directory._load_channel_directory_config", return_value=config), \
+             patch("gateway.channel_directory._gateway_discord_scope", return_value=(set(), set())), \
+             patch("gateway.channel_directory._build_from_sessions", return_value=[]):
+            result = load_directory()
+        assert result["platforms"]["discord"] == [{"id": "111:222", "name": "known", "type": "channel"}]
+
+    def test_config_failure_denies_discovery_delivery_and_cached_entries(self, tmp_path):
+        from gateway.config import Platform
+
+        cache_file = _write_directory(tmp_path, {"discord": [{"id": "111", "name": "cached", "type": "channel"}]})
+        with patch("gateway.channel_directory._load_channel_directory_config", return_value=None), \
+             patch("gateway.channel_directory._build_discord") as build_discord, \
+             patch("gateway.channel_directory._load_channel_aliases", return_value={"discord": {"222": "must-not-inject"}}), \
+             patch("gateway.channel_directory.DIRECTORY_PATH", cache_file):
+            rebuilt = asyncio.run(build_channel_directory({Platform.DISCORD: object()}))
+            loaded = load_directory()
+            allowed = channel_directory.discord_target_is_scoped("111")
+        assert rebuilt["platforms"]["discord"] == []
+        assert loaded["platforms"]["discord"] == []
+        assert allowed is False
+        build_discord.assert_not_called()
+
+    def test_explicit_invalid_discovery_policy_denies_instead_of_broadening(self):
+        assert channel_directory._discord_directory_discovery_mode(
+            {"channel_directory": {"discord_discovery": "typo"}}
+        ) == "deny"
+        assert channel_directory._discord_directory_discovery_mode(
+            {"channel_directory": {"discord_discovery": True}}
+        ) == "deny"
+        assert channel_directory._discord_directory_discovery_mode(
+            {"channel_directory": []}
+        ) == "deny"
+
+    def test_unscoped_target_check_preserves_existing_delivery_behavior(self):
+        with patch("gateway.channel_directory._load_channel_directory_config", return_value={}):
+            assert channel_directory.discord_target_is_scoped("999") is None
 
     def test_session_discovery_runs_off_event_loop_thread(self, tmp_path):
         from gateway.config import Platform

@@ -460,6 +460,15 @@ def _handle_send(args):
                 f"or set a home channel via: hermes config set {home_env} <channel_id>"
             })
 
+    if platform_name == "discord":
+        try:
+            from gateway.channel_directory import discord_target_is_scoped
+            scoped = discord_target_is_scoped(chat_id, thread_id=thread_id)
+        except Exception:
+            return json.dumps({"error": "Discord target scope validation is unavailable; message was not sent."})
+        if scoped is False:
+            return json.dumps({"error": "Discord target is outside this profile's approved scope; message was not sent."})
+
     duplicate_skip = _maybe_skip_cron_duplicate_send(platform_name, chat_id, thread_id)
     if duplicate_skip:
         return json.dumps(duplicate_skip)
