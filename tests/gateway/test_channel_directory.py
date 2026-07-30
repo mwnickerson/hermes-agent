@@ -156,6 +156,32 @@ class TestBuildChannelDirectoryOffload:
 
         assert entries == [session_entry]
 
+    def test_scoped_builder_rejects_malformed_or_separated_profile_sessions(self, monkeypatch):
+        allowed = {"id": "111:333", "name": "known-session", "type": "thread", "thread_id": "333"}
+        malformed = {"id": "legacy-thread", "name": "old-session", "type": "thread", "thread_id": None}
+        separated_profile = {"id": "999:444", "name": "Red Antonetta / old thread", "type": "thread", "thread_id": "444"}
+        adapter = SimpleNamespace(_client=SimpleNamespace(guilds=[]))
+        monkeypatch.setitem(sys.modules, "discord", SimpleNamespace())
+        monkeypatch.setattr(channel_directory, "_build_from_sessions", lambda platform: [allowed, malformed, separated_profile])
+
+        entries = channel_directory._build_discord(adapter, scoped_ids=set())
+
+        assert entries == [allowed]
+
+    def test_scoped_target_check_rejects_malformed_or_separated_profile_sessions(self):
+        config = {"channel_directory": {"discord_discovery": "scoped"}, "discord": {}}
+        sessions = [
+            {"id": "111:333", "name": "known-session", "type": "thread"},
+            {"id": "legacy-thread", "name": "old-session", "type": "thread"},
+            {"id": "999:444", "name": "Red Antonetta / old thread", "type": "thread"},
+        ]
+        with patch("gateway.channel_directory._load_channel_directory_config", return_value=config), \
+             patch("gateway.channel_directory._gateway_discord_scope", return_value=(set(), set())), \
+             patch("gateway.channel_directory._build_from_sessions", return_value=sessions):
+            assert channel_directory.discord_target_is_scoped("111", thread_id="333") is True
+            assert channel_directory.discord_target_is_scoped("999", thread_id="444") is False
+            assert channel_directory.discord_target_is_scoped("legacy-thread") is False
+
     def test_scoped_aliases_cannot_inject_undiscovered_discord_targets(self):
         platforms = {"discord": [{"id": "111", "name": "original", "type": "channel"}]}
         with patch("gateway.channel_directory._load_channel_aliases", return_value={"discord": {"111": "renamed", "222": "undiscovered"}}):
@@ -170,6 +196,22 @@ class TestBuildChannelDirectoryOffload:
              patch("gateway.channel_directory._gateway_discord_scope", return_value=(set(), set())), \
              patch("gateway.channel_directory._build_from_sessions", return_value=[]), \
              patch("gateway.channel_directory._load_channel_aliases", return_value={"discord": {"999": "cannot-return"}}):
+            result = load_directory()
+        assert result["platforms"]["discord"] == [{"id": "111", "name": "allowed", "type": "channel"}]
+
+    def test_scoped_load_removes_cached_separated_profile_thread_even_when_its_ids_are_allowed(self, tmp_path):
+        cache_file = _write_directory(tmp_path, {"discord": [
+            {"id": "111", "name": "allowed", "type": "channel"},
+            {"id": "111:222", "name": "Red Antonetta / old thread", "type": "thread"},
+        ]})
+        config = {
+            "channel_directory": {"discord_discovery": "scoped"},
+            "discord": {"allowed_channels": ["111"], "channel_overrides": {"222": {}}},
+        }
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             patch("gateway.channel_directory._load_channel_directory_config", return_value=config), \
+             patch("gateway.channel_directory._gateway_discord_scope", return_value=(set(), set())), \
+             patch("gateway.channel_directory._build_from_sessions", return_value=[]):
             result = load_directory()
         assert result["platforms"]["discord"] == [{"id": "111", "name": "allowed", "type": "channel"}]
 

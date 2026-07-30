@@ -35,6 +35,8 @@ _DISCORD_VALUE_SCOPE_FIELDS = (
     "cron_errors_channel",
 )
 _DISCORD_ID_RE = re.compile(r"\b\d{3,}\b")
+_DISCORD_SESSION_ID_RE = re.compile(r"^\d{3,}(?::\d{3,})?$")
+_SEPARATED_PROFILE_MARKER = re.compile(r"\bred[-_ ]?antonetta\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -250,13 +252,44 @@ def _session_scope(entries: List[Dict[str, str]]) -> set[str]:
     return scope
 
 
+def _scoped_discord_entry_is_safe(entry: object) -> bool:
+    """Reject malformed or separated-profile entries at the scoped boundary."""
+
+    if not isinstance(entry, dict):
+        return False
+    entry_id = entry.get("id")
+    name = entry.get("name")
+    return (
+        isinstance(entry_id, str)
+        and _DISCORD_SESSION_ID_RE.fullmatch(entry_id) is not None
+        and not (isinstance(name, str) and _SEPARATED_PROFILE_MARKER.search(name))
+    )
+
+
+def _scoped_discord_session_entries(entries: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Keep only structurally valid, Regular-safe Discord session entries.
+
+    The scoped directory is a delivery boundary, not a historical session
+    browser.  Old local sessions can contain malformed origin identifiers or
+    names from a profile that has since moved to its own host.  Neither may
+    expand Regular Antonetta's discovery or target scope.  The unrestricted
+    legacy mode intentionally keeps its existing behavior.
+    """
+
+    approved: List[Dict[str, str]] = []
+    for entry in entries:
+        if _scoped_discord_entry_is_safe(entry):
+            approved.append(entry)
+    return approved
+
+
 def _scoped_discord_scope(config: Dict[str, Any]) -> Optional[_DiscordScope]:
     """Combine configured routing targets with this profile's session origins."""
 
     scope = _configured_discord_scope(config)
     if scope is None:
         return None
-    session_entries = _build_from_sessions("discord")
+    session_entries = _scoped_discord_session_entries(_build_from_sessions("discord"))
     session_parents = _session_scope(session_entries)
     session_threads = {
         entry_id.split(":", 1)[1]
@@ -278,8 +311,7 @@ def _filter_scoped_discord_entries(platforms: Dict[str, Any], scope: Optional[_D
     platforms["discord"] = [
         entry
         for entry in entries
-        if isinstance(entry, dict)
-        and isinstance(entry.get("id"), str)
+        if _scoped_discord_entry_is_safe(entry)
         and scope is not None
         and scope.admits(*entry["id"].split(":", 1))
     ]
@@ -480,6 +512,8 @@ def _build_discord(adapter, *, scoped_ids: Optional[set[str]] = None) -> List[Di
         return channels
 
     session_entries = _build_from_sessions("discord")
+    if scoped_ids is not None:
+        session_entries = _scoped_discord_session_entries(session_entries)
     admitted_ids = None if scoped_ids is None else set(scoped_ids) | _session_scope(session_entries)
     for guild in client.guilds:
         for ch in guild.text_channels:
