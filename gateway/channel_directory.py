@@ -9,10 +9,13 @@ action="list" and for resolving human-friendly channel names to numeric IDs.
 import asyncio
 import json
 import logging
+import os
+import re
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from hermes_cli.config import get_hermes_home
+from hermes_cli.config import get_hermes_home, load_config_readonly
 from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
@@ -25,6 +28,278 @@ DIRECTORY_PATH = get_hermes_home() / "channel_directory.json"
 # letting you pre-name a chat before it has produced any traffic).
 # Format: {"<platform>": {"<chat_id>": "<friendly name>", ...}, ...}
 CHANNEL_ALIASES_PATH = get_hermes_home() / "channel_aliases.json"
+_DISCORD_DISCOVERY_MODES = frozenset({"all", "scoped"})
+_DISCORD_VALUE_SCOPE_FIELDS = (
+    "allowed_channels",
+    "free_response_channels",
+    "cron_errors_channel",
+)
+_DISCORD_ID_RE = re.compile(r"\b\d{3,}\b")
+
+
+@dataclass(frozen=True)
+class _DiscordScope:
+    """The profile-owned Discord parents and explicitly known threads."""
+
+    parent_ids: frozenset[str]
+    thread_ids: frozenset[str]
+
+    def admits(self, chat_id: str, thread_id: Optional[str] = None) -> bool:
+        if str(chat_id) not in self.parent_ids:
+            return False
+        # Discord's delivery adapter sends a thread ID directly.  A scoped
+        # parent therefore cannot authorize an arbitrary child thread.
+        return not thread_id or str(thread_id) in self.thread_ids
+
+
+def _profile_config_is_readable() -> bool:
+    """Confirm the current profile config can be parsed before trusting it.
+
+    ``load_config_readonly`` deliberately returns defaults or last-known-good
+    config after a parse failure. That is useful for availability, but a
+    directory isolation boundary must not silently broaden on that fallback.
+    """
+
+    try:
+        from hermes_cli.config import fast_safe_load, get_config_path
+
+        config_path = get_config_path()
+        if not config_path.exists():
+            return True
+        with open(config_path, encoding="utf-8") as f:
+            return isinstance(fast_safe_load(f) or {}, dict)
+    except Exception:
+        return False
+
+
+def _load_channel_directory_config() -> Optional[Dict[str, Any]]:
+    """Load the current profile config, returning ``None`` on any failure."""
+
+    if not _profile_config_is_readable():
+        return None
+    try:
+        config = load_config_readonly()
+    except Exception:
+        return None
+    return config if isinstance(config, dict) else None
+
+
+def _discord_directory_discovery_mode(config: Optional[Dict[str, Any]]) -> str:
+    """Return the configured Discord directory discovery mode.
+
+    ``all`` preserves Hermes's established behavior. ``scoped`` admits only
+    IDs configured for this profile plus its own session origins; it never
+    falls back to every channel visible to the bot.
+    """
+
+    # Config failures deny Discord discovery and delivery. A successful config
+    # read without an explicit scope retains the established ``all`` mode.
+    if config is None:
+        return "deny"
+    directory = config.get("channel_directory")
+    if directory is None:
+        return "all"
+    if not isinstance(directory, dict):
+        return "deny"
+    if "discord_discovery" not in directory:
+        return "all"
+    mode = directory["discord_discovery"]
+    if not isinstance(mode, str):
+        return "deny"
+    normalized = mode.strip().lower()
+    return normalized if normalized in _DISCORD_DISCOVERY_MODES else "deny"
+
+
+def _discord_ids(value: Any, *, mapping_keys: bool = False) -> set[str]:
+    """Extract opaque numeric Discord IDs without interpreting friendly text."""
+
+    if isinstance(value, bool) or value is None:
+        return set()
+    if isinstance(value, int):
+        return {str(value)}
+    if isinstance(value, str):
+        return set(_DISCORD_ID_RE.findall(value))
+    if isinstance(value, (list, tuple, set)):
+        return set().union(*(_discord_ids(item) for item in value)) if value else set()
+    if isinstance(value, dict):
+        source = value.keys() if mapping_keys else ()
+        return set().union(*(_discord_ids(item) for item in source)) if value else set()
+    return set()
+
+
+def _discord_config_blocks(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return the raw Discord config blocks that gateway routing can consume."""
+
+    blocks: List[Dict[str, Any]] = []
+    direct = config.get("discord")
+    if isinstance(direct, dict):
+        blocks.append(direct)
+    platforms = config.get("platforms")
+    if isinstance(platforms, dict):
+        nested = platforms.get("discord")
+        if isinstance(nested, dict):
+            blocks.append(nested)
+    for block in list(blocks):
+        extra = block.get("extra")
+        if isinstance(extra, dict):
+            blocks.append(extra)
+    return blocks
+
+
+def _binding_ids(value: Any) -> set[str]:
+    """Extract documented ``channel_skill_bindings[].id`` values."""
+
+    if not isinstance(value, list):
+        return set()
+    ids: set[str] = set()
+    for entry in value:
+        if isinstance(entry, dict):
+            ids.update(_discord_ids(entry.get("id")))
+    return ids
+
+
+def _scope_ids_from_config_block(block: Dict[str, Any]) -> tuple[set[str], set[str]]:
+    """Extract parent and thread IDs from one gateway-compatible block."""
+
+    parent_ids: set[str] = set()
+    thread_ids: set[str] = set()
+    for field in _DISCORD_VALUE_SCOPE_FIELDS:
+        ids = _discord_ids(block.get(field))
+        parent_ids.update(ids)
+        thread_ids.update(ids)
+    for field in ("channel_prompts", "channel_overrides"):
+        ids = _discord_ids(block.get(field), mapping_keys=True)
+        parent_ids.update(ids)
+        thread_ids.update(ids)
+    bindings = _binding_ids(block.get("channel_skill_bindings"))
+    parent_ids.update(bindings)
+    thread_ids.update(bindings)
+
+    home = block.get("home_channel")
+    if isinstance(home, dict):
+        parent_ids.update(_discord_ids(home.get("chat_id")))
+        thread_ids.update(_discord_ids(home.get("thread_id")))
+    return parent_ids, thread_ids
+
+
+def _gateway_discord_scope() -> Optional[tuple[set[str], set[str]]]:
+    """Read resolved gateway routing, including env overrides and home channel.
+
+    ``None`` is intentionally distinct from an empty scope: it means the
+    gateway configuration could not be read and callers must deny delivery.
+    """
+
+    try:
+        from gateway.config import Platform, load_gateway_config
+
+        platform_config = load_gateway_config().platforms.get(Platform.DISCORD)
+    except Exception:
+        return None
+    if platform_config is None:
+        return set(), set()
+
+    parent_ids: set[str] = set()
+    thread_ids: set[str] = set()
+    extra = getattr(platform_config, "extra", {})
+    if isinstance(extra, dict):
+        raw_parent_ids, raw_thread_ids = _scope_ids_from_config_block(extra)
+        parent_ids.update(raw_parent_ids)
+        thread_ids.update(raw_thread_ids)
+    overrides = getattr(platform_config, "channel_overrides", {})
+    if isinstance(overrides, dict):
+        override_ids = _discord_ids(overrides, mapping_keys=True)
+        parent_ids.update(override_ids)
+        thread_ids.update(override_ids)
+    home = getattr(platform_config, "home_channel", None)
+    if home is not None:
+        parent_ids.update(_discord_ids(getattr(home, "chat_id", None)))
+        thread_ids.update(_discord_ids(getattr(home, "thread_id", None)))
+    for env_name in ("DISCORD_ALLOWED_CHANNELS", "DISCORD_FREE_RESPONSE_CHANNELS"):
+        env_ids = _discord_ids(os.environ.get(env_name))
+        parent_ids.update(env_ids)
+        thread_ids.update(env_ids)
+    return parent_ids, thread_ids
+
+
+def _configured_discord_scope(config: Dict[str, Any]) -> Optional[_DiscordScope]:
+    """Collect this profile's routed Discord parents and known threads."""
+
+    parent_ids: set[str] = set()
+    thread_ids: set[str] = set()
+    for block in _discord_config_blocks(config):
+        raw_parent_ids, raw_thread_ids = _scope_ids_from_config_block(block)
+        parent_ids.update(raw_parent_ids)
+        thread_ids.update(raw_thread_ids)
+    gateway_scope = _gateway_discord_scope()
+    if gateway_scope is None:
+        return None
+    resolved_parent_ids, resolved_thread_ids = gateway_scope
+    parent_ids.update(resolved_parent_ids)
+    thread_ids.update(resolved_thread_ids)
+    return _DiscordScope(frozenset(parent_ids), frozenset(thread_ids))
+
+
+def _session_scope(entries: List[Dict[str, str]]) -> set[str]:
+    """Return parent IDs from profile-local Discord session entries."""
+
+    scope: set[str] = set()
+    for entry in entries:
+        raw_id = entry.get("id")
+        if isinstance(raw_id, str) and raw_id:
+            scope.add(raw_id.split(":", 1)[0])
+    return scope
+
+
+def _scoped_discord_scope(config: Dict[str, Any]) -> Optional[_DiscordScope]:
+    """Combine configured routing targets with this profile's session origins."""
+
+    scope = _configured_discord_scope(config)
+    if scope is None:
+        return None
+    session_entries = _build_from_sessions("discord")
+    session_parents = _session_scope(session_entries)
+    session_threads = {
+        entry_id.split(":", 1)[1]
+        for entry in session_entries
+        if isinstance(entry_id := entry.get("id"), str) and ":" in entry_id
+    }
+    return _DiscordScope(
+        scope.parent_ids | frozenset(session_parents),
+        scope.thread_ids | frozenset(session_threads),
+    )
+
+
+def _filter_scoped_discord_entries(platforms: Dict[str, Any], scope: Optional[_DiscordScope]) -> None:
+    """Remove persisted Discord entries that are outside the profile scope."""
+
+    entries = platforms.get("discord")
+    if not isinstance(entries, list):
+        return
+    platforms["discord"] = [
+        entry
+        for entry in entries
+        if isinstance(entry, dict)
+        and isinstance(entry.get("id"), str)
+        and scope is not None
+        and scope.admits(*entry["id"].split(":", 1))
+    ]
+
+
+def discord_target_is_scoped(chat_id: str, *, thread_id: Optional[str] = None) -> Optional[bool]:
+    """Check a Discord target against the active profile's optional scope.
+
+    ``None`` means the profile retained Hermes's default unrestricted
+    directory behavior. In scoped mode, raw IDs are checked too so callers
+    cannot bypass the same boundary used for directory discovery.
+    """
+
+    config = _load_channel_directory_config()
+    if _discord_directory_discovery_mode(config) != "scoped":
+        return False if config is None else None
+    scope = _scoped_discord_scope(config)
+    if scope is None:
+        return False
+    return scope.admits(chat_id, thread_id)
 
 
 def _load_channel_aliases() -> Dict[str, Dict[str, str]]:
@@ -38,7 +313,7 @@ def _load_channel_aliases() -> Dict[str, Dict[str, str]]:
         return {}
 
 
-def _apply_channel_aliases(platforms: Dict[str, Any]) -> None:
+def _apply_channel_aliases(platforms: Dict[str, Any], *, scoped_discord: bool = False) -> None:
     """Overlay friendly names onto directory entries by chat_id.
 
     Renames matching entries in place; injects a placeholder entry for an
@@ -62,7 +337,7 @@ def _apply_channel_aliases(platforms: Dict[str, Any]) -> None:
                 if isinstance(e, dict) and e.get("id") == chat_id:
                     e["name"] = friendly
                     matched = True
-            if not matched:
+            if not matched and not (scoped_discord and plat_name == "discord"):
                 entries.append({
                     "id": chat_id,
                     "name": friendly,
@@ -119,10 +394,25 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
 
     platforms: Dict[str, List[Dict[str, str]]] = {}
 
+    config = _load_channel_directory_config()
+    discord_discovery_mode = _discord_directory_discovery_mode(config)
     for platform, adapter in adapters.items():
         try:
             if platform == Platform.DISCORD:
-                platforms["discord"] = await asyncio.to_thread(_build_discord, adapter)
+                if discord_discovery_mode == "deny":
+                    platforms["discord"] = []
+                    continue
+                if discord_discovery_mode == "scoped":
+                    scope = _configured_discord_scope(config)
+                    if scope is None:
+                        platforms["discord"] = []
+                        continue
+                    scoped_ids = set(scope.parent_ids)
+                else:
+                    scoped_ids = None
+                platforms["discord"] = await asyncio.to_thread(
+                    _build_discord, adapter, scoped_ids=scoped_ids
+                )
             elif platform == Platform.SLACK:
                 platforms["slack"] = await _build_slack(adapter)
         except Exception as e:
@@ -162,7 +452,7 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
         pass
 
     # Overlay user-maintained friendly names before persisting.
-    _apply_channel_aliases(platforms)
+    _apply_channel_aliases(platforms, scoped_discord=discord_discovery_mode != "all")
 
     directory = {
         "updated_at": datetime.now().isoformat(),
@@ -177,8 +467,8 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
     return directory
 
 
-def _build_discord(adapter) -> List[Dict[str, str]]:
-    """Enumerate all text channels and forum channels the Discord bot can see."""
+def _build_discord(adapter, *, scoped_ids: Optional[set[str]] = None) -> List[Dict[str, str]]:
+    """Build Discord entries, filtering guild discovery when a scope is set."""
     channels = []
     client = getattr(adapter, "_client", None)
     if not client:
@@ -189,28 +479,32 @@ def _build_discord(adapter) -> List[Dict[str, str]]:
     except ImportError:
         return channels
 
+    session_entries = _build_from_sessions("discord")
+    admitted_ids = None if scoped_ids is None else set(scoped_ids) | _session_scope(session_entries)
     for guild in client.guilds:
         for ch in guild.text_channels:
-            channels.append({
-                "id": str(ch.id),
-                "name": ch.name,
-                "guild": guild.name,
-                "type": "channel",
-            })
+            if admitted_ids is None or str(ch.id) in admitted_ids:
+                channels.append({
+                    "id": str(ch.id),
+                    "name": ch.name,
+                    "guild": guild.name,
+                    "type": "channel",
+                })
         # Forum channels (type 15) — creating a message auto-spawns a thread post.
         forums = getattr(guild, "forum_channels", None) or []
         for ch in forums:
-            channels.append({
-                "id": str(ch.id),
-                "name": ch.name,
-                "guild": guild.name,
-                "type": "forum",
-            })
-        # Also include DM-capable users we've interacted with is not
-        # feasible via guild enumeration; those come from sessions.
+            if admitted_ids is None or str(ch.id) in admitted_ids:
+                channels.append({
+                    "id": str(ch.id),
+                    "name": ch.name,
+                    "guild": guild.name,
+                    "type": "forum",
+                })
+    # DM-capable users are not feasible to enumerate from a guild; they
+    # always come from profile-local sessions below.
 
     # Merge any DMs from session history
-    channels.extend(_build_from_sessions("discord"))
+    channels.extend(session_entries)
     return channels
 
 
@@ -380,18 +674,28 @@ def load_directory() -> Dict[str, Any]:
     """Load the cached channel directory from disk."""
     if not DIRECTORY_PATH.exists():
         base = {"updated_at": None, "platforms": {}}
-        _apply_channel_aliases(base["platforms"])
+        config = _load_channel_directory_config()
+        restricted_discord = _discord_directory_discovery_mode(config) != "all"
+        _apply_channel_aliases(base["platforms"], scoped_discord=restricted_discord)
         return base
     try:
         with open(DIRECTORY_PATH, encoding="utf-8") as f:
             data = json.load(f)
         # Re-apply aliases on read so friendly names take effect immediately,
         # even between timed rebuilds and for brand-new alias entries.
-        _apply_channel_aliases(data.setdefault("platforms", {}))
+        config = _load_channel_directory_config()
+        platforms = data.setdefault("platforms", {})
+        restricted_discord = _discord_directory_discovery_mode(config) != "all"
+        if restricted_discord:
+            scope = _scoped_discord_scope(config) if config is not None else None
+            _filter_scoped_discord_entries(platforms, scope)
+        _apply_channel_aliases(platforms, scoped_discord=restricted_discord)
         return data
     except Exception:
         base = {"updated_at": None, "platforms": {}}
-        _apply_channel_aliases(base["platforms"])
+        config = _load_channel_directory_config()
+        restricted_discord = _discord_directory_discovery_mode(config) != "all"
+        _apply_channel_aliases(base["platforms"], scoped_discord=restricted_discord)
         return base
 
 
